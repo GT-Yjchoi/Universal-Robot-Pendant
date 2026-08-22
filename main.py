@@ -21,7 +21,7 @@ from PySide6.QtGui import (QFont, QFontDatabase, QShortcut, QKeySequence,
                            QSurfaceFormat)
 from ui.main_window import MainWindow
 from ui.theme import APP_STYLESHEET
-from utils.plc_client import PLCClient
+from drivers.plc import PLCClient
 from utils.paths import get_base_dir
 
 

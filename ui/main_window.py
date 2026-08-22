@@ -36,7 +36,7 @@ from utils.alarm_history import record as record_alarm
 from utils.op_history import record as record_op
 
 # 유틸리티 임포트
-from utils.plc_client import PLCClient
+from drivers.plc import PLCClient
 
 try:
     from utils.gpio_estop import GpioEstop

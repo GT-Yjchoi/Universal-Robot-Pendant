@@ -25,6 +25,19 @@ Qt의 EGLFS 플러그인은 현재 PySide6 ARM64 wheel에서 의존 라이브러
 검증된 구성은 Raspberry Pi의 Mesa/V3D 위에 최소 Weston DRM compositor만 띄우는 방식이다.
 Raspberry Pi OS Desktop은 필요하지 않다.
 
+### 통신 드라이버
+
+- `drivers.plc.PLCClient`: 기존 PLC 통신 공개 API. 현재 팬던트의 기본 백엔드로 유지한다.
+- `drivers.fastech_ezi_io.EziIOClient`: FASTECH Ezi-IO Plus-E UDP 드라이버.
+  Linux에서 제조사 Windows DLL 없이 UDP 3001 프로토콜을 직접 사용한다.
+- Ezi-IO 출력 쓰기는 기본 잠금 상태이며 `allow_writes=True`를 명시해야 한다.
+- `scripts/ezi_io_probe.py <IP>`: 장치 정보와 입출력 상태만 읽는 안전한 연결 시험.
+- `scripts/ezi_io_output_test.py <IP>`: 부하가 없는 I8O8 모듈의 8개 출력과 하드웨어 트리거 시험.
+
+현재 검증 장치는 `Ezi-IO-EN-I8O8N-T` (`192.168.0.5`)이다. Raspberry Pi의
+`eth0`는 게이트웨이 없는 `192.168.0.10/24` DIO 전용망으로 구성하고, 원격 관리용
+Wi-Fi 기본 경로와 분리한다. 프로토콜의 16/32비트 필드는 network byte order(big-endian)를 사용한다.
+
 ---
 
 ## 프로젝트 구조
