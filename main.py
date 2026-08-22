@@ -116,9 +116,8 @@ def _load_bundled_fonts(app: QApplication) -> None:
 
 
 def main():
-    # [Mali/Wayland] QQuickWidget(QML GPU 페이지)용 EGL 설정.
-    # Mali wayland EGL config = rgba 8/8/8/0 dep0 stcl0. QML 씬그래프는
-    # SHM 폴백이 없어 이 포맷을 기본값으로 깔아야 EGLConfig 매칭됨.
+    # QQuickWidget(QML GPU 페이지)용 OpenGL ES/EGL 설정.
+    # QML 씬그래프가 사용할 포맷을 명시해 EGLConfig 매칭을 안정화한다.
     # 일반 QWidget 에는 영향 없음.
     _fmt = QSurfaceFormat()
     _fmt.setRenderableType(QSurfaceFormat.OpenGLES)

@@ -1,6 +1,6 @@
 # Universal Robot Pendant — 산업용 서보 제어 HMI
 
-ODROID-M1S 기반 PySide6 풀스크린 HMI 앱.
+Raspberry Pi 5와 Raspberry Pi OS Lite 64-bit 기반 PySide6 풀스크린 HMI 앱.
 파나소닉 PLC(FPWIN Pro)와 TCP(MEWTOCOL-style) 통신으로 8축 서보 시스템을 제어하고 시퀀스·포인트를 관리합니다.
 
 ---
@@ -9,41 +9,21 @@ ODROID-M1S 기반 PySide6 풀스크린 HMI 앱.
 
 | 항목 | 값 |
 |---|---|
-| 플랫폼 | ODROID-M1S (aarch64, Cortex-A55 / Mali-G52) |
-| OS | Ubuntu 24.04 Server — 데스크탑 없음 |
-| Python | `/home/odroid/pyside-env/bin/python` + PySide6 venv |
-| 프로젝트 경로 | `/home/odroid/Universal-Robot-Pendant/` |
-| 가상환경 | `/home/odroid/pyside-env` |
-| Qt 플랫폼 | **Wayland on weston kiosk** (`QT_QPA_PLATFORM=wayland`, `wayland-egl`) — Mali EGL GPU 렌더 |
-| 디스플레이 | ODROID DSI 패널 구성 (`weston.ini`에서 kiosk/출력/회전 관리) |
+| 플랫폼 | Raspberry Pi 5 (aarch64) |
+| OS | Raspberry Pi OS Lite 64-bit — 데스크톱 환경 없음 |
+| Python | `/home/yjchoi/pyside-env/bin/python` + PySide6 venv |
+| 프로젝트 경로 | `/home/yjchoi/Universal-Robot-Pendant/` |
+| 가상환경 | `/home/yjchoi/pyside-env` |
+| Qt 플랫폼 | **Wayland on Weston DRM kiosk** (`QT_QPA_PLATFORM=wayland`) |
+| 디스플레이 | Raspberry Pi DSI 패널 (`weston-rpi.ini`에서 출력/회전 관리) |
 | 터치 입력 | weston/libinput 입력 처리 |
-| 자동 실행 | `pendant.service` → `launch.sh` → weston kiosk + `main.py` |
+| 자동 실행 | `pendant-rpi-lite.service` → `launch-rpi-lite.sh` → Weston kiosk + `main.py` |
 | WiFi 스캔 권한 | polkit 규칙 `/etc/polkit-1/rules.d/50-netdev-wifi.rules` + `netdev` 그룹 |
 | 유선 이더넷 | NM 프로파일에 `ipv4.never-default=yes` — PLC 전용 LAN 이 디폴트 라우트로 승격되는 것 차단 |
 
-> M1S에서는 `scripts/m1s-bootstrap.sh`가 libmali g24p0, DSI overlay, weston kiosk, PySide6 venv를 먼저 구성하고, `setup.sh`가 NetworkManager/polkit/udev/systemd 등록을 마무리한다. 앱은 `eglfs`가 아니라 `launch.sh`에서 띄운 weston 위의 Qt Wayland 클라이언트로 실행된다.
-
-### M1S GPU 드라이버 조합
-
-현재 검증된 조합은 **Mali-G52 g24p0 ARM blob + weston Wayland EGL** 이다. 여러 libmali/Mesa/Panfrost 조합을 테스트한 뒤, 실제 kiosk 렌더링과 PySide6 QML 스크롤에서 안정적으로 동작한 버전은 아래 패키지였다.
-
-- 패키지: `libmali-bifrost-g52-g24p0-wayland-gbm_1.9-1_arm64.deb`
-- 출처: `scripts/m1s-bootstrap.sh` 의 `MALI_DEB_URL`
-- build tag: `g24p0-00eac0`
-- 설치 파일: `/usr/lib/aarch64-linux-gnu/libmali.so.1.9.0`
-- 실행 방식: `libmali-setup.service` 가 `libEGL`, `libGLESv2`, `libgbm`, `libwayland-egl` 을 Mali blob 쪽으로 bind-mount
-- 앱 환경: `QT_QPA_PLATFORM=wayland`, `QT_WAYLAND_CLIENT_BUFFER_INTEGRATION=wayland-egl`
-
-정상 동작 시 weston 로그에는 다음 계열이 찍힌다.
-
-```text
-EGL vendor: ARM
-EGL version: 1.5 Bifrost-"g24p0-00eac0"
-GL version: OpenGL ES 3.2 v1.g24p0-00eac0...
-GL renderer: Mali-G52
-```
-
-`libmali-bifrost-g52-g24p0-wayland-gbm` 패키지는 apt 업그레이드로 다른 blob/stub 으로 바뀌지 않도록 `apt-mark hold` 상태로 둔다. GPU 표시가 느려지거나 QML 스크롤이 끊기면 먼저 `/tmp/pendant-weston.log`, `systemctl status libmali-setup`, `apt-mark showhold` 를 확인한다.
+Qt의 EGLFS 플러그인은 현재 PySide6 ARM64 wheel에서 의존 라이브러리가 빠져 실행되지 않아,
+검증된 구성은 Raspberry Pi의 Mesa/V3D 위에 최소 Weston DRM compositor만 띄우는 방식이다.
+Raspberry Pi OS Desktop은 필요하지 않다.
 
 ---
 
@@ -53,8 +33,9 @@ GL renderer: Mali-G52
 Pendant/
 ├── main.py                        # 진입점 (QApplication, PLCClient, MainWindow) + 스크린샷 핫키(F12) / 우상단 3초 롱프레스
 ├── main.spec                      # PyInstaller 빌드 스펙
-├── pendant.service                # systemd 서비스 파일 (M1S weston kiosk 런처 호출)
-├── setup.sh                       # 신규 M1S 일괄 세팅 (NM + polkit + udev + systemd)
+├── pendant-rpi-lite.service       # Raspberry Pi OS Lite 자동 실행 서비스
+├── launch-rpi-lite.sh             # Weston DRM kiosk + 앱 실행기
+├── weston-rpi.ini                 # DSI 출력과 화면 회전 설정
 ├── settings.json                  # 사용자 설정 (PLC IP/Port, 밸브, IO 이름, 축 등)
 ├── style.qss                      # 전역 스타일시트 (Fusion 기반)
 ├── new_plc_fb.st                  # PLC 펑션블록 (현재 사용, 3-instance + 콜스택 + 파렛타이징 통합)
@@ -581,7 +562,7 @@ HMI 가 PLC 에 새로 연결되거나 레시피가 교체될 때 **백그라운
 
 - **F12** 키 또는 화면 **우상단 100×100 영역 3초 롱프레스** → `~/screenshots/pendant_YYYYMMDD_HHMMSS.png` 저장 + 하단 토스트 알림
 - 저장 함수는 `QWidget.grab()` 기반이라 weston kiosk 환경에서도 풀스크린 캡처 가능
-- 원격 SSH 로 가져오려면: `scp odroid@pendant:/home/odroid/screenshots/* .`
+- 원격 SSH 로 가져오려면: `scp yjchoi@192.168.1.190:/home/yjchoi/screenshots/* .`
 
 ### UI 터치 최적화 (2026-04)
 
@@ -674,23 +655,23 @@ g_StepAlarmPrev := g_StepAlarm;
 
 ---
 
-## 신규 ODROID-M1S 초기 세팅
+## Raspberry Pi OS Lite 초기 세팅
 
 ```bash
 git clone git@github.com:GT-Yjchoi/Universal-Robot-Pendant.git
 cd Universal-Robot-Pendant
-bash scripts/m1s-bootstrap.sh
-bash setup.sh
-sudo reboot
+sudo apt update
+sudo apt install -y python3-venv python3-lgpio weston libqt6waylandclient6
+python3 -m venv ~/pyside-env
+~/pyside-env/bin/pip install --upgrade pip PySide6
+sudo install -m 0644 pendant-rpi-lite.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now pendant-rpi-lite.service
 ```
 
-`setup.sh` 가 수행하는 일:
-1. `scripts/m1s-bootstrap.sh` 결과 확인 (`~/pyside-env`, PySide6, weston)
-2. NetworkManager / `python3-lgpio` 패키지 확인 및 설치
-3. polkit 규칙 + 현 사용자 `netdev` 그룹 추가 (WiFi nmcli 허용)
-4. 이더넷 프로파일에 `ipv4.never-default=yes` (LAN 전용 PLC 네트워크)
-5. 백라이트 udev 권한 적용 (`video` 그룹 쓰기)
-6. `pendant.service` → `/etc/systemd/system/` 복사 + `systemctl enable`
+서비스 파일의 `User`, `Group`, 홈 경로와 UID(기본 1000)는 실제 설치 계정에 맞춰야 한다.
+DSI 커넥터 이름과 회전 방향은 `weston-rpi.ini`에서 조정한다. GPIO 비상정지는 기본적으로
+비활성화되어 있으며, 실제 line 번호와 배선을 확인한 뒤 환경변수로 활성화한다.
 
 SSH 키 미등록 시:
 ```bash
@@ -698,17 +679,13 @@ ssh-keygen -t ed25519 -C "<email>"
 cat ~/.ssh/id_ed25519.pub   # GitHub → Settings → SSH keys 에 등록
 ```
 
-> M1S의 디스플레이/GPU/weston 기본 구성은 `scripts/m1s-bootstrap.sh`가 담당한다. 앱 서비스 구성만 다시 적용할 때는 `bash setup.sh`를 재실행하면 된다.
-
----
-
 ## 서비스 관리
 
 ```bash
-sudo systemctl start pendant       # 시작
-sudo systemctl stop pendant        # 정지
-sudo systemctl restart pendant     # 재시작 (코드 변경 후)
-journalctl -u pendant -f           # 실시간 로그
+sudo systemctl start pendant-rpi-lite       # 시작
+sudo systemctl stop pendant-rpi-lite        # 정지
+sudo systemctl restart pendant-rpi-lite     # 재시작 (코드 변경 후)
+journalctl -u pendant-rpi-lite -f           # 실시간 로그
 ```
 
 ---
@@ -716,8 +693,8 @@ journalctl -u pendant -f           # 실시간 로그
 ## 빌드 방법 (PyInstaller)
 
 ```bash
-cd /home/odroid/Universal-Robot-Pendant
-source /home/odroid/pyside-env/bin/activate
+cd /home/yjchoi/Universal-Robot-Pendant
+source /home/yjchoi/pyside-env/bin/activate
 pyinstaller --clean -y main.spec
 ```
 
@@ -728,12 +705,12 @@ pyinstaller --clean -y main.spec
 ## 개발 실행 (서비스 안 거치고 포그라운드 실행)
 
 ```bash
-sudo systemctl stop pendant   # tty1 점유 해제
-cd /home/odroid/Universal-Robot-Pendant
-./launch.sh
+sudo systemctl stop pendant-rpi-lite   # tty1 점유 해제
+cd /home/yjchoi/Universal-Robot-Pendant
+./launch-rpi-lite.sh
 ```
 
-> `launch.sh`는 weston kiosk를 띄운 뒤 같은 Wayland 소켓에서 `main.py`를 실행한다. 보통은 `journalctl -u pendant -f`, `/tmp/pendant-app.log`, `/tmp/pendant-weston.log`를 보면서 작업하는 것이 편하다.
+> `launch-rpi-lite.sh`는 Weston kiosk를 띄운 뒤 같은 Wayland 소켓에서 `main.py`를 실행한다. 보통은 `journalctl -u pendant-rpi-lite -f`와 `/tmp/pendant-weston.log`를 보면서 작업하는 것이 편하다.
 
 ---
 
@@ -777,7 +754,6 @@ vt.global_cursor_default=0 consoleblank=0 fbcon=map:2 logo.nologo
 - `fbcon=map:2` — fbcon 을 존재하지 않는 FB 로 돌려 FB0 점유 해제 (핵심)
 - `logo.nologo` — 부팅 로고 제거
 
-> `setup.sh` 의 `[3/5]` 단계가 이 플래그를 멱등하게 추가한다. 새 하드웨어에선 자동 적용됨.
 > 재부팅 없이 임시로만 끄려면: `sudo sh -c 'echo 0 > /sys/class/vtconsole/vtcon1/bind'`
 
 ### 앱 종료 & tty 복귀
@@ -811,7 +787,7 @@ JMP 스텝의 `target_idx` 는 콤보 인덱스 = **원본 리스트 인덱스 (
 
 - **무선**: 현재 SSID/IP/신호 표시, 스캔/암호 입력(터치 키보드)/연결 해제. 탭이 보이는 동안 15초마다 자동 스캔.
 - **유선**: 인터페이스/상태/IP/게이트웨이/방식(DHCP/고정) 표시, DHCP 적용 · 고정 IP 설정(IP/prefix/GW/DNS).
-- WiFi 스캔은 polkit 인증이 필요 — `setup.sh` 가 `netdev` 그룹에 권한 부여 규칙을 설치.
+- WiFi 스캔은 polkit 인증이 필요할 수 있으므로 배포 시 실행 사용자의 `netdev` 권한을 확인한다.
 
 > 핸드폰 핫스팟이 안 잡힐 때: iOS 는 핫스팟 설정 화면을 열어둔 상태에서만 5GHz 비콘을 활발히 송출. 2.4GHz 로 설정하면 안정적.
 

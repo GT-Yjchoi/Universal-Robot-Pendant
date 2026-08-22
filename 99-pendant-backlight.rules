@@ -1,6 +1,6 @@
 # Pendant 키오스크: 백라이트 brightness 파일을 video 그룹에서 쓰기 가능하게.
 # (이전엔 부팅마다 max_brightness 를 강제로 써 밝기를 최대 고정했으나 제거.
 #  밝기는 앱이 settings.json 의 "screen_brightness" 값으로 설정한다.)
-# odroid 사용자는 video 그룹이므로 sudo 없이 밝기 조절 가능.
-# setup.sh 가 /etc/udev/rules.d/ 로 설치.
+# 실행 사용자를 video 그룹에 추가하면 sudo 없이 밝기를 조절할 수 있다.
+# /etc/udev/rules.d/ 에 설치해 사용한다.
 ACTION=="add", SUBSYSTEM=="backlight", KERNEL=="backlight", RUN+="/bin/chgrp video /sys/class/backlight/%k/brightness", RUN+="/bin/chmod g+w /sys/class/backlight/%k/brightness"

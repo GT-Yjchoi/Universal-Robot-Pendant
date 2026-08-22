@@ -1,6 +1,5 @@
 #!/bin/bash
-# Raspberry Pi OS Desktop용 실행기.
-# 기존 launch.sh는 ODROID-M1S에서 Weston DRM을 직접 띄우는 용도다.
+# Raspberry Pi OS Desktop의 기존 Wayland 세션에서 실행하는 개발용 실행기.
 
 set -eu
 

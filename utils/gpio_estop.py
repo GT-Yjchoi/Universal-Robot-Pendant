@@ -1,39 +1,25 @@
-"""
-GPIO 비상정지 모니터 (ODROID-M1S)
+"""선택형 Linux GPIO 비상정지 모니터.
 
-배선:
-    3.3V ──[3kΩ]──┬── 물리핀 15 (=DTS PIN_15)
-                  │
-               [NC버튼]
-                  │
-                 GND
-
-M1S 핀 매핑:
-    물리핀 15  →  /dev/gpiochip0 line 18  (DTS 라벨 "PIN_15")
-    `gpioinfo /dev/gpiochip0 | grep PIN_15` 로 검증 가능.
-
-동작:
-    - 정상: line LOW  (0V)   → DT213 = 0
-    - 비상: line HIGH (3.3V) → DT213 = 1
-
-방식: QTimer 폴링 (20ms 주기) + lgpio 사용
+GPIO chip/line 번호는 보드와 커널 설정에 따라 달라지므로 환경변수로 지정한다.
+기본값은 ``/dev/gpiochip0`` line 18이며 실제 배선 전 ``gpioinfo``로 확인해야 한다.
+이 기능은 ``PENDANT_GPIO_ESTOP=1``일 때만 활성화된다.
 """
 
 import sys
 import os
 from PySide6.QtCore import QObject, Signal, QTimer
 
-ESTOP_CHIP   = 0    # /dev/gpiochip0
-ESTOP_PIN    = 18   # gpiochip0 line 18 = 40핀 헤더 물리핀 15 (M1S)
-POLL_MS      = 20   # 폴링 주기 (ms)
-DEBOUNCE_CNT = 3    # 연속 N회 같은 값 → 상태 확정 (20ms × 3 = 60ms)
+ESTOP_CHIP   = int(os.environ.get("PENDANT_ESTOP_CHIP", "0"))
+ESTOP_PIN    = int(os.environ.get("PENDANT_ESTOP_LINE", "18"))
+POLL_MS      = 20
+DEBOUNCE_CNT = 3
 
 # 시스템 Python dist-packages 경로 추가 (lgpio가 시스템에만 깔린 경우)
 _SYS_DIST = "/usr/lib/python3/dist-packages"
 if _SYS_DIST not in sys.path:
     sys.path.insert(0, _SYS_DIST)
 
-_GPIO_ENABLED = os.environ.get("PENDANT_GPIO_ESTOP", "1").strip().lower() \
+_GPIO_ENABLED = os.environ.get("PENDANT_GPIO_ESTOP", "0").strip().lower() \
     not in {"0", "false", "no", "off"}
 
 try:
@@ -43,7 +29,7 @@ try:
     _h = lgpio.gpiochip_open(ESTOP_CHIP)
     lgpio.gpio_claim_input(_h, ESTOP_PIN, lgpio.SET_PULL_UP)
     _GPIO_AVAILABLE = True
-    print(f"[GPIO E-Stop] lgpio 초기화 완료 (gpiochip{ESTOP_CHIP} line {ESTOP_PIN}, 물리핀 15)")
+    print(f"[GPIO E-Stop] lgpio 초기화 완료 (gpiochip{ESTOP_CHIP} line {ESTOP_PIN})")
 except Exception as e:
     _GPIO_AVAILABLE = False
     _h = None
@@ -52,7 +38,7 @@ except Exception as e:
 
 class GpioEstop(QObject):
     """
-    QTimer 폴링으로 GPIO22를 감시해 소프트 비상정지 신호를 발행.
+    QTimer 폴링으로 지정 GPIO line을 감시해 소프트 비상정지 신호를 발행.
 
     sig_estop(bool):
         True  → 비상정지 발동  (GPIO LOW)

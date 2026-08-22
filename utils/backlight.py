@@ -1,12 +1,11 @@
 """화면 백라이트 밝기 제어 + settings.json 영구화.
 
 sysfs /sys/class/backlight/<dev>/brightness 를 직접 기록한다(udev 규칙
-99-pendant-backlight.rules 가 video 그룹에 쓰기 허용; odroid 는 video 그룹).
+99-pendant-backlight.rules 가 video 그룹에 쓰기 허용).
 밝기값은 패널 무관하게 0~100(%) 으로 settings.json 의 "screen_brightness"
 키에 저장하고, 적용 시 max_brightness 로 환산한다.
 
-기존엔 setup.sh / udev 가 부팅마다 max_brightness 를 강제로 써 밝기를
-최대 고정했으나, 해당 하드코딩을 제거하고 저장된 사용자 값을 쓴다.
+저장된 사용자 값을 사용하므로 부팅마다 최대 밝기로 고정하지 않는다.
 """
 import glob
 import os

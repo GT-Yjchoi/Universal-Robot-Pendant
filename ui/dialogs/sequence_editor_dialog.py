@@ -112,7 +112,7 @@ class TouchScrollListWidget(QListWidget):
         self._double_tap_timer.setSingleShot(True)
         self._double_tap_timer.timeout.connect(self._commit_single_tap)
         self.setVerticalScrollMode(QListWidget.ScrollPerPixel)
-        # M1S(Cortex-A55) 스크롤 경량화: 행이 전부 균일 높이(QSS 42px, 순수 텍스트)
+        # 저사양 ARM 보드 스크롤 경량화: 행이 전부 균일 높이(QSS 42px, 순수 텍스트)
         # 라 행별 sizeHint/지오메트리 재계산을 생략하고 고정 stride 페인트 경로 사용.
         # 외형·선택·로직·PLC 거동 불변, CPU 래스터 부하만 감소.
         self.setUniformItemSizes(True)
