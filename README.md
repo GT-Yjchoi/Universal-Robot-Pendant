@@ -1,4 +1,4 @@
-# Pendant — 산업용 서보 제어 HMI
+# Universal Robot Pendant — 산업용 서보 제어 HMI
 
 ODROID-M1S 기반 PySide6 풀스크린 HMI 앱.
 파나소닉 PLC(FPWIN Pro)와 TCP(MEWTOCOL-style) 통신으로 8축 서보 시스템을 제어하고 시퀀스·포인트를 관리합니다.
@@ -12,7 +12,7 @@ ODROID-M1S 기반 PySide6 풀스크린 HMI 앱.
 | 플랫폼 | ODROID-M1S (aarch64, Cortex-A55 / Mali-G52) |
 | OS | Ubuntu 24.04 Server — 데스크탑 없음 |
 | Python | `/home/odroid/pyside-env/bin/python` + PySide6 venv |
-| 프로젝트 경로 | `/home/odroid/hana-Pendant/` |
+| 프로젝트 경로 | `/home/odroid/Universal-Robot-Pendant/` |
 | 가상환경 | `/home/odroid/pyside-env` |
 | Qt 플랫폼 | **Wayland on weston kiosk** (`QT_QPA_PLATFORM=wayland`, `wayland-egl`) — Mali EGL GPU 렌더 |
 | 디스플레이 | ODROID DSI 패널 구성 (`weston.ini`에서 kiosk/출력/회전 관리) |
@@ -677,8 +677,8 @@ g_StepAlarmPrev := g_StepAlarm;
 ## 신규 ODROID-M1S 초기 세팅
 
 ```bash
-git clone git@github.com:GT-Yjchoi/hana-Pendant.git
-cd hana-Pendant
+git clone git@github.com:GT-Yjchoi/Universal-Robot-Pendant.git
+cd Universal-Robot-Pendant
 bash scripts/m1s-bootstrap.sh
 bash setup.sh
 sudo reboot
@@ -716,7 +716,7 @@ journalctl -u pendant -f           # 실시간 로그
 ## 빌드 방법 (PyInstaller)
 
 ```bash
-cd /home/odroid/hana-Pendant
+cd /home/odroid/Universal-Robot-Pendant
 source /home/odroid/pyside-env/bin/activate
 pyinstaller --clean -y main.spec
 ```
@@ -729,7 +729,7 @@ pyinstaller --clean -y main.spec
 
 ```bash
 sudo systemctl stop pendant   # tty1 점유 해제
-cd /home/odroid/hana-Pendant
+cd /home/odroid/Universal-Robot-Pendant
 ./launch.sh
 ```
 

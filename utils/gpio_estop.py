@@ -33,7 +33,12 @@ _SYS_DIST = "/usr/lib/python3/dist-packages"
 if _SYS_DIST not in sys.path:
     sys.path.insert(0, _SYS_DIST)
 
+_GPIO_ENABLED = os.environ.get("PENDANT_GPIO_ESTOP", "1").strip().lower() \
+    not in {"0", "false", "no", "off"}
+
 try:
+    if not _GPIO_ENABLED:
+        raise RuntimeError("PENDANT_GPIO_ESTOP 환경변수로 비활성화됨")
     import lgpio
     _h = lgpio.gpiochip_open(ESTOP_CHIP)
     lgpio.gpio_claim_input(_h, ESTOP_PIN, lgpio.SET_PULL_UP)

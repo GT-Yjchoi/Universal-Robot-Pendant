@@ -8,7 +8,7 @@ Type=simple
 User=odroid
 Group=odroid
 SupplementaryGroups=video render input dialout gpio netdev
-WorkingDirectory=/home/odroid/hana-Pendant
+WorkingDirectory=/home/odroid/Universal-Robot-Pendant
 
 Environment=HOME=/home/odroid
 Environment=XDG_RUNTIME_DIR=/run/user/1000
@@ -26,7 +26,7 @@ TTYVTDisallocate=yes
 # (이 옵션이 launch.sh stdout 을 tty 로 뺏아가므로 launch.sh 가 자체 파일로 redirect)
 PAMName=login
 
-ExecStart=/home/odroid/hana-Pendant/launch.sh
+ExecStart=/home/odroid/Universal-Robot-Pendant/launch.sh
 Restart=on-failure
 RestartSec=3
 

@@ -324,7 +324,7 @@ if [ $FAIL_COUNT -eq 0 ]; then
     echo "  2. ${C_YLW}sudo reboot${C_RST}"
     echo "  3. 부팅 후 DSI 화면에 텍스트 콘솔이 떠야 정상"
     echo "  4. (선택) tty 에서 weston + PySide6 hello world 검증:"
-    echo "     - hana-Pendant/scripts/m1s-verify-gui.sh 가 있으면 그걸 실행"
+    echo "     - Universal-Robot-Pendant/scripts/m1s-verify-gui.sh 가 있으면 그걸 실행"
     echo "     - 또는 weston 직접 + venv 의 PySide6 import 확인"
     exit 0
 else

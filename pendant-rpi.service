@@ -1,0 +1,17 @@
+[Unit]
+Description=Universal Robot Pendant HMI (Raspberry Pi Desktop Wayland)
+After=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Universal-Robot-Pendant
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=WAYLAND_DISPLAY=wayland-0
+Environment=QT_QPA_PLATFORM=wayland
+Environment=PENDANT_GPIO_ESTOP=0
+ExecStart=%h/Universal-Robot-Pendant/launch-rpi-wayland.sh
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
