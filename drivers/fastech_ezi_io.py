@@ -65,11 +65,19 @@ class EziIOClient:
         *,
         timeout: float = 0.1,
         allow_writes: bool = False,
+        output_offset: int = 0,
+        output_count: int = 16,
     ) -> None:
         self.host = host
         self.port = int(port)
         self.timeout = float(timeout)
         self.allow_writes = bool(allow_writes)
+        if not 0 <= output_offset <= 31:
+            raise ValueError("output_offset must be in range 0..31")
+        if not 1 <= output_count <= 32 - output_offset:
+            raise ValueError("output_count exceeds the 32-bit I/O map")
+        self.output_offset = int(output_offset)
+        self.output_count = int(output_count)
         self._socket: socket.socket | None = None
         self._sync = 0
         self._lock = threading.Lock()
@@ -164,21 +172,35 @@ class EziIOClient:
         self._request(self.SET_OUTPUT, payload)
 
     def set_channel(self, channel: int, enabled: bool) -> None:
-        if not 0 <= channel <= 31:
-            raise ValueError("channel must be in range 0..31")
-        mask = 1 << channel
+        if not 0 <= channel < self.output_count:
+            raise ValueError(f"channel must be in range 0..{self.output_count - 1}")
+        mask = 1 << (self.output_offset + channel)
         self.set_output(set_mask=mask if enabled else 0, reset_mask=0 if enabled else mask)
+
+    def logical_outputs(self) -> int:
+        """Return the configured model's output bank shifted to logical channel 0."""
+        mask = (1 << self.output_count) - 1
+        return (self.get_output().outputs >> self.output_offset) & mask
 
     def configure_trigger(self, channel: int, *, period_ms: int, on_ms: int, count: int) -> None:
         self._require_writes()
-        if not 0 <= channel <= 15:
-            raise ValueError("trigger channel must be in range 0..15")
+        if not 0 <= channel < self.output_count:
+            raise ValueError(f"trigger channel must be in range 0..{self.output_count - 1}")
+        physical_channel = self.output_offset + channel
+        if physical_channel > 15:
+            raise ValueError("this module protocol supports trigger channels 0..15")
         if not 1 <= on_ms < period_ms <= 65535:
             raise ValueError("require 1 <= on_ms < period_ms <= 65535")
         if not 1 <= count <= 0xFFFFFFFF:
             raise ValueError("count must be in range 1..4294967295")
-        payload = struct.pack(">BHHHHI", channel, period_ms, 0, on_ms, 0, count)
+        payload = struct.pack(">BHHHHI", physical_channel, period_ms, 0, on_ms, 0, count)
         self._request(self.SET_TRIGGER, payload)
+
+    def run_channel_trigger(self, channel: int, *, run: bool) -> None:
+        if not 0 <= channel < self.output_count:
+            raise ValueError(f"channel must be in range 0..{self.output_count - 1}")
+        mask = 1 << (self.output_offset + channel)
+        self.run_trigger(run_mask=mask if run else 0, stop_mask=0 if run else mask)
 
     def run_trigger(self, *, run_mask: int = 0, stop_mask: int = 0) -> None:
         self._require_writes()

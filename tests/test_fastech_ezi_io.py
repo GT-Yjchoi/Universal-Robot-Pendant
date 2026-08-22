@@ -32,6 +32,16 @@ class EziIOClientTests(unittest.TestCase):
             EziIOClient.SET_OUTPUT, struct.pack(">II", 1 << 3, 0)
         )
 
+    def test_i8o8_channel_zero_maps_to_bit_eight(self):
+        client = EziIOClient(
+            "192.0.2.1", allow_writes=True, output_offset=8, output_count=8
+        )
+        client._request = Mock(return_value=b"")
+        client.set_channel(0, True)
+        client._request.assert_called_once_with(
+            EziIOClient.SET_OUTPUT, struct.pack(">II", 1 << 8, 0)
+        )
+
     def test_trigger_frame_is_thirteen_bytes(self):
         client = EziIOClient("192.0.2.1", allow_writes=True)
         client._request = Mock(return_value=b"")
