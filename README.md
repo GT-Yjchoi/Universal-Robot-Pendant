@@ -36,7 +36,7 @@ Raspberry Pi OS Desktop은 필요하지 않다.
 
 현재 검증 장치는 `Ezi-IO-EN-I8O8N-T` (`192.168.0.5`)이다. Raspberry Pi의
 `eth0`는 게이트웨이 없는 `192.168.0.10/24` DIO 전용망으로 구성하고, 원격 관리용
-Wi-Fi 기본 경로와 분리한다. 프로토콜의 16/32비트 필드는 network byte order(big-endian)를 사용한다.
+Wi-Fi 기본 경로와 분리한다. 프로토콜의 16/32비트 필드는 little-endian을 사용한다.
 I8O8의 논리 출력 0~7은 통합 프로토콜 비트맵의 bit 8~15에 대응하므로 클라이언트를
 `output_offset=8, output_count=8`로 생성한다.
 

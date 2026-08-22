@@ -152,23 +152,23 @@ class EziIOClient:
         data = self._request(self.GET_INPUT)
         if len(data) != 8:
             raise EziIOProtocolError(f"GET_INPUT returned {len(data)} data bytes")
-        inputs, latch = struct.unpack(">II", data)
+        inputs, latch = struct.unpack("<II", data)
         return InputState(inputs=inputs, latch=latch)
 
     def clear_latch(self, mask: int) -> None:
         self._require_writes()
-        self._request(self.CLEAR_LATCH, struct.pack(">I", mask & 0xFFFFFFFF))
+        self._request(self.CLEAR_LATCH, struct.pack("<I", mask & 0xFFFFFFFF))
 
     def get_output(self) -> OutputState:
         data = self._request(self.GET_OUTPUT)
         if len(data) != 8:
             raise EziIOProtocolError(f"GET_OUTPUT returned {len(data)} data bytes")
-        outputs, running = struct.unpack(">II", data)
+        outputs, running = struct.unpack("<II", data)
         return OutputState(outputs=outputs, trigger_running=running)
 
     def set_output(self, *, set_mask: int = 0, reset_mask: int = 0) -> None:
         self._require_writes()
-        payload = struct.pack(">II", set_mask & 0xFFFFFFFF, reset_mask & 0xFFFFFFFF)
+        payload = struct.pack("<II", set_mask & 0xFFFFFFFF, reset_mask & 0xFFFFFFFF)
         self._request(self.SET_OUTPUT, payload)
 
     def set_channel(self, channel: int, enabled: bool) -> None:
@@ -193,7 +193,7 @@ class EziIOClient:
             raise ValueError("require 1 <= on_ms < period_ms <= 65535")
         if not 1 <= count <= 0xFFFFFFFF:
             raise ValueError("count must be in range 1..4294967295")
-        payload = struct.pack(">BHHHHI", physical_channel, period_ms, 0, on_ms, 0, count)
+        payload = struct.pack("<BHHHHI", physical_channel, period_ms, 0, on_ms, 0, count)
         self._request(self.SET_TRIGGER, payload)
 
     def run_channel_trigger(self, channel: int, *, run: bool) -> None:
@@ -204,5 +204,5 @@ class EziIOClient:
 
     def run_trigger(self, *, run_mask: int = 0, stop_mask: int = 0) -> None:
         self._require_writes()
-        payload = struct.pack(">II", run_mask & 0xFFFFFFFF, stop_mask & 0xFFFFFFFF)
+        payload = struct.pack("<II", run_mask & 0xFFFFFFFF, stop_mask & 0xFFFFFFFF)
         self._request(self.SET_RUN_STOP, payload)
