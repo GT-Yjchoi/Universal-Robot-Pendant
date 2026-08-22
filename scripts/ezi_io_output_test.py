@@ -2,7 +2,11 @@
 """Destructive output test for an unconnected Ezi-IO I8O8 module."""
 
 import argparse
+from pathlib import Path
+import sys
 import time
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from drivers.fastech_ezi_io import EziIOClient
 
