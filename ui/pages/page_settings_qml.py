@@ -8,7 +8,7 @@
   - _save_axis_settings / _load_axis_settings
   - _apply_io_names / _load_io_input_names / _sync_valve_names_to_io
   - 알람 CRUD / PLC 연결·상태 / 인터록 / WiFi·Ethernet
-다이얼로그·오버레이·WiFi 워커는 page_settings.py 의 것을 그대로 재사용.
+WiFi/이더넷 작업은 Python 워커에서 처리하고 모든 시각 팝업은 공통 QML 오버레이를 사용한다.
 
 ⚠ valve/param/interlock/dataset 의 실제 동작·모션한계는 실장비에서 전수
 재검증 필수 (무PLC 환경에선 UI/스크롤/로직구조까지만 검증 가능).
@@ -19,22 +19,16 @@ import os
 from PySide6.QtCore import (Qt, QObject, Signal, Slot, Property, QUrl, QTimer,
                             QAbstractListModel, QModelIndex, QByteArray)
 from PySide6.QtGui import QColor
-from PySide6.QtWidgets import QVBoxLayout, QWidget, QDialog, QApplication
+from PySide6.QtWidgets import QVBoxLayout, QWidget, QApplication
 from PySide6.QtQuickWidgets import QQuickWidget
 
 from utils.paths import get_settings_path as _get_settings_path
 from utils.json_utils import load_json, save_json
 from utils import backlight
 
-# page_settings.py 의 오버레이/워커/다이얼로그 그대로 재사용
+# 네트워크 상태 워커는 Python 백엔드에 유지한다. 시각 팝업은 모두 QML이다.
 from ui.pages.page_settings import (
-    NumberInputOverlay, ConfirmOverlay, _EthernetStaticDialog,
     WifiScanWorker, EthernetStatusWorker, WifiStatusWorker, AXIS_NAMES)
-
-try:
-    from widgets.touch_keyboard import TouchKeyboard
-except ImportError:
-    TouchKeyboard = None
 try:
     from utils.io_manager import IOManager
 except ImportError:
@@ -422,6 +416,14 @@ class PageSettingsQml(QWidget):
         self._refresh_all_models()
         self.update_language()
 
+    def _overlay(self):
+        return getattr(self.window(), "qml_overlay", None)
+
+    def _message(self, title, message, *, error=False):
+        overlay = self._overlay()
+        if overlay:
+            overlay.show_message(title, message, error=error)
+
     # ---- 모델 갱신 ----
     def _io_row(self, i):
         xa = i if i < 16 else i + 16
@@ -478,14 +480,13 @@ class PageSettingsQml(QWidget):
     # 밸브 설정 — page_settings.py 와 동일 (값 출처만 상태배열)
     # ===================================================================
     def _edit_valve_name(self, idx):
-        if not TouchKeyboard:
-            return
-        dlg = TouchKeyboard("밸브 이름 입력", self._v_name[idx], self)
-        if dlg.exec() == QDialog.Accepted:
-            new_name = dlg.get_text()
-            if new_name:
-                self._v_name[idx] = new_name
-                self._refresh_valve_row(idx)
+        overlay = self._overlay()
+        if overlay:
+            def done(accepted, value):
+                if accepted and value.strip():
+                    self._v_name[idx] = value.strip()
+                    self._refresh_valve_row(idx)
+            overlay.request_text("밸브 이름 입력", self._v_name[idx], callback=done)
 
     def _move_valve_up(self, idx):
         if idx == 0:
@@ -560,10 +561,7 @@ class PageSettingsQml(QWidget):
             print("[Settings] 밸브 설정 저장 완료")
             self._be.sig_valve_config_changed.emit()
             self._sync_valve_names_to_io()
-            dlg = ConfirmOverlay("저장 완료", "밸브 설정이 저장되었습니다.",
-                                 btn_yes="확인", parent=self.window())
-            dlg.btn_cancel.hide()
-            dlg.exec()
+            self._message("저장 완료", "밸브 설정이 저장되었습니다.")
         except Exception as e:
             print(f"[Settings] 밸브 설정 저장 실패: {e}")
 
@@ -606,37 +604,43 @@ class PageSettingsQml(QWidget):
     # ===================================================================
     def _edit_stroke(self, i):
         text = self._p_stroke[i].replace(" mm", "").strip()
-        dlg = NumberInputOverlay(text, is_ip=False, parent=self)
-        if dlg.exec():
-            try:
-                val = float(dlg.result_val)
-                self._p_stroke[i] = f"{val:.3f} mm"
-                self._refresh_param_model()
-            except ValueError:
-                pass
+        overlay = self._overlay()
+        if overlay:
+            def done(accepted, value):
+                if accepted:
+                    self._p_stroke[i] = f"{float(value):.3f} mm"
+                    self._refresh_param_model()
+            overlay.request_number("스트로크 (mm)", float(text or 0), decimal=True,
+                                   signed=True, callback=done)
 
     def _edit_num(self, arr, i):
-        dlg = NumberInputOverlay(arr[i], is_ip=False, parent=self)
-        if dlg.exec():
-            arr[i] = dlg.result_val
-            self._refresh_param_model()
+        overlay = self._overlay()
+        if overlay:
+            def done(accepted, value):
+                if accepted:
+                    arr[i] = str(int(value) if float(value).is_integer() else value)
+                    self._refresh_param_model()
+            overlay.request_number("값 입력", float(arr[i] or 0), decimal=True,
+                                   signed=True, callback=done)
 
     def _on_home_toggle_clicked(self):
         self._p_home = not self._p_home
         self._be.changed.emit()
         if self.plc_client and self.plc_client.is_connected:
-            self.plc_client.send_jog_mode(1 if self._p_home else 0)
+            self.plc_client.submit(self.plc_client.send_jog_mode, 1 if self._p_home else 0)
 
     def _on_dataset_pressed(self, axis_index):
         if not self.plc_client or not self.plc_client.is_connected:
             return
         val = (1 << axis_index)
-        self.plc_client.write_words(0x09, self.plc_client.ADDR_AXIS_DATASET, [val])
+        self.plc_client.submit(self.plc_client.write_words, 0x09,
+                               self.plc_client.ADDR_AXIS_DATASET, [val])
 
     def _on_dataset_released(self, axis_index):
         if not self.plc_client or not self.plc_client.is_connected:
             return
-        self.plc_client.write_words(0x09, self.plc_client.ADDR_AXIS_DATASET, [0])
+        self.plc_client.submit(self.plc_client.write_words, 0x09,
+                               self.plc_client.ADDR_AXIS_DATASET, [0])
 
     def _load_params(self):
         axis_uses_from_file = self._load_axis_settings()
@@ -647,10 +651,17 @@ class PageSettingsQml(QWidget):
                         self._p_use[i] = bool(axis_uses_from_file[i])
             self._refresh_param_model()
             return
+        self.plc_client.submit(
+            self.plc_client.read_words, 0x09, self.plc_client.AXIS_PARAM_ADDR, 50,
+            callback=self._on_params_loaded,
+        )
+
+    def _on_params_loaded(self, data, error):
         try:
-            data = self.plc_client.read_words(0x09, self.plc_client.AXIS_PARAM_ADDR, 50)
+            if error is not None:
+                raise error
             if not data or len(data) < 50:
-                return
+                raise RuntimeError("PLC axis parameter response is incomplete")
             use_bits = data[0]
             for i in range(8):
                 self._p_use[i] = bool((use_bits >> i) & 1)
@@ -678,10 +689,7 @@ class PageSettingsQml(QWidget):
 
     def _save_params(self):
         if not self.plc_client or not self.plc_client.is_connected:
-            dlg = ConfirmOverlay("전송 실패", "PLC가 연결되어 있지 않습니다.",
-                                 btn_yes="확인", parent=self.window())
-            dlg.btn_cancel.hide()
-            dlg.exec()
+            self._message("전송 실패", "PLC가 연결되어 있지 않습니다.", error=True)
             return
         try:
             send_data = [0] * 50
@@ -722,19 +730,18 @@ class PageSettingsQml(QWidget):
                 idx = 34 + i * 2
                 send_data[idx] = val & 0xFFFF
                 send_data[idx + 1] = (val >> 16) & 0xFFFF
-            self.plc_client.write_words(0x09, self.plc_client.AXIS_PARAM_ADDR,
-                                        send_data)
-            self._save_axis_settings(axis_uses_list, axis_strokes_list)
-            dlg = ConfirmOverlay("적용 완료",
-                                 "시스템 파라미터가 PLC와 파일에 저장되었습니다.",
-                                 btn_yes="확인", parent=self.window())
-            dlg.btn_cancel.hide()
-            dlg.exec()
+            def saved(result, error):
+                if error is not None or not result:
+                    self._message("오류", f"데이터 전송 중 오류가 발생했습니다.\n{error or 'write failed'}", error=True)
+                    return
+                self._save_axis_settings(axis_uses_list, axis_strokes_list)
+                self._message("적용 완료", "시스템 파라미터가 PLC와 파일에 저장되었습니다.")
+            self.plc_client.submit(
+                self.plc_client.write_words, 0x09, self.plc_client.AXIS_PARAM_ADDR,
+                send_data, callback=saved,
+            )
         except Exception as e:
-            dlg = ConfirmOverlay("오류", f"데이터 전송 중 오류가 발생했습니다.\n{e}",
-                                 btn_yes="확인", parent=self.window())
-            dlg.btn_cancel.hide()
-            dlg.exec()
+            self._message("오류", f"데이터 전송 중 오류가 발생했습니다.\n{e}", error=True)
 
     def _save_axis_settings(self, axis_uses_list, axis_strokes_list=None):
         try:
@@ -766,15 +773,16 @@ class PageSettingsQml(QWidget):
     # IO 이름 — page_settings 와 동일
     # ===================================================================
     def _edit_io_name(self, i, is_input):
-        if not TouchKeyboard:
-            return
         arr = self._in_name if is_input else self._out_name
         addr = (f"X{i if i<16 else i+16:02X}" if is_input
                 else f"Y{i if i<16 else i+16:02X}")
-        dlg = TouchKeyboard(addr, parent=self)
-        if dlg.exec() == QDialog.Accepted:
-            arr[i] = dlg.get_text()
-            self._refresh_io_row(i)
+        overlay = self._overlay()
+        if overlay:
+            def done(accepted, value):
+                if accepted and value.strip():
+                    arr[i] = value.strip()
+                    self._refresh_io_row(i)
+            overlay.request_text(addr, arr[i], callback=done)
 
     def _apply_io_names(self):
         if not IOManager:
@@ -794,10 +802,7 @@ class PageSettingsQml(QWidget):
             print("[Settings] IO 입력 이름 저장 완료")
         except Exception as e:
             print(f"[Settings] IO 입력 이름 저장 실패: {e}")
-        dlg = ConfirmOverlay("적용 완료", "I/O 이름이 적용되었습니다.",
-                             btn_yes="확인", parent=self.window())
-        dlg.btn_cancel.hide()
-        dlg.exec()
+        self._message("적용 완료", "I/O 이름이 적용되었습니다.")
 
     def _load_io_input_names(self):
         from utils.io_manager import DEFAULT_INPUTS
@@ -837,47 +842,43 @@ class PageSettingsQml(QWidget):
         from ui.overlays.alarm_overlay import USER_ALARMS
         return max(USER_ALARMS.keys(), default=0) + 1
 
-    def _alarm_input(self, title, current=""):
-        if TouchKeyboard:
-            kb = TouchKeyboard(title, current, self)
-            if kb.exec() != QDialog.Accepted:
-                return None
-            return kb.get_text().strip() or None
-        return None
-
     def _add_alarm(self):
         from ui.overlays.alarm_overlay import USER_ALARMS
         no = self._alarm_next_no()
-        msg = self._alarm_input(f"A-{no:03d} 알람 메시지 입력")
-        if msg is None:
-            return
-        USER_ALARMS[no] = msg
-        self._refresh_alarm_model()
+        overlay = self._overlay()
+        if overlay:
+            def done(accepted, value):
+                if accepted and value.strip():
+                    USER_ALARMS[no] = value.strip()
+                    self._refresh_alarm_model()
+            overlay.request_text(f"A-{no:03d} 알람 메시지 입력", callback=done)
 
     def _edit_alarm(self, no):
         from ui.overlays.alarm_overlay import USER_ALARMS
         current = USER_ALARMS.get(no, "")
-        msg = self._alarm_input(f"A-{no:03d} 알람 메시지 수정", current)
-        if msg is None:
-            return
-        USER_ALARMS[no] = msg
-        self._refresh_alarm_model()
+        overlay = self._overlay()
+        if overlay:
+            def done(accepted, value):
+                if accepted and value.strip():
+                    USER_ALARMS[no] = value.strip()
+                    self._refresh_alarm_model()
+            overlay.request_text(f"A-{no:03d} 알람 메시지 수정", current, callback=done)
 
     def _delete_alarm(self, no):
         from ui.overlays.alarm_overlay import USER_ALARMS
-        from ui.dialogs.sequence_utils import DarkConfirmDialog
-        dlg = DarkConfirmDialog("알람 삭제",
-                                f"A-{no:03d} 알람을 삭제하시겠습니까?", self)
-        if dlg.exec() == QDialog.Accepted:
-            USER_ALARMS.pop(no, None)
-            self._refresh_alarm_model()
+        overlay = self._overlay()
+        if overlay:
+            def done(accepted):
+                if accepted:
+                    USER_ALARMS.pop(no, None)
+                    self._refresh_alarm_model()
+            overlay.request_confirm("알람 삭제", f"A-{no:03d} 알람을 삭제하시겠습니까?",
+                                    callback=done)
 
     def _save_alarms(self):
         from ui.overlays.alarm_overlay import save_user_alarms
-        from ui.dialogs.sequence_utils import DarkMessageDialog
         save_user_alarms()
-        DarkMessageDialog("저장 완료", "알람 메시지가 저장되었습니다.",
-                          parent=self).exec()
+        self._message("저장 완료", "알람 메시지가 저장되었습니다.")
 
     # ===================================================================
     # 인터록 — 같은 QML 씬 내 풀스크린 오버레이 (별도 윈도우 X).
@@ -1030,13 +1031,22 @@ class PageSettingsQml(QWidget):
     def _edit_general(self, which):
         is_ip = (which == "ip")
         cur = self._ip if is_ip else self._port
-        dlg = NumberInputOverlay(cur, is_ip=is_ip, parent=self)
-        if dlg.exec():
+        overlay = self._overlay()
+        if not overlay:
+            return
+        def done(accepted, value):
+            if not accepted:
+                return
             if is_ip:
-                self._ip = dlg.result_val
+                self._ip = value.strip()
             else:
-                self._port = dlg.result_val
+                self._port = str(int(value))
             self._be.changed.emit()
+        if is_ip:
+            overlay.request_text("PLC IP", cur, callback=done)
+        else:
+            overlay.request_number("PLC PORT", float(cur or 0), minimum=1,
+                                   maximum=65535, callback=done)
 
     def _on_connect_clicked(self):
         if not self.plc_client:
@@ -1085,10 +1095,13 @@ class PageSettingsQml(QWidget):
             print(f"[Settings] PLC 설정 로드 실패: {e}")
 
     def _on_exit_clicked(self):
-        dlg = ConfirmOverlay("프로그램 종료", "정말로 프로그램을 종료하시겠습니까?",
-                             btn_yes="종료", btn_no="취소", parent=self.window())
-        if dlg.exec():
-            QApplication.instance().quit()
+        overlay = self._overlay()
+        if overlay:
+            overlay.request_confirm(
+                "프로그램 종료", "정말로 프로그램을 종료하시겠습니까?",
+                accept_text="종료", reject_text="취소",
+                callback=lambda accepted: QApplication.instance().quit() if accepted else None,
+            )
 
     def _set_language(self, code):
         if not LanguageManager:
@@ -1223,15 +1236,17 @@ class PageSettingsQml(QWidget):
         secured = bool(net["security"]) and net["security"] != "--"
         password = None
         if secured:
-            if TouchKeyboard is None:
-                self._show_wifi_msg("오류", "터치 키보드 모듈을 사용할 수 없습니다.")
-                return
-            kb = TouchKeyboard(title=f"'{ssid}' 암호", default_text="", parent=self)
-            if kb.exec() != QDialog.Accepted:
-                return
-            password = kb.get_text()
-            if not password:
-                return
+            overlay = self._overlay()
+            if overlay:
+                overlay.request_text(
+                    f"'{ssid}' 암호", password=True,
+                    callback=lambda accepted, value: self._connect_wifi(ssid, value)
+                    if accepted and value else None,
+                )
+            return
+        self._connect_wifi(ssid, password)
+
+    def _connect_wifi(self, ssid, password=None):
         try:
             res = self._wifi.connect(ssid, password)
         except Exception as e:
@@ -1269,10 +1284,7 @@ class PageSettingsQml(QWidget):
         self._refresh_wifi_status()
 
     def _show_wifi_msg(self, title, message):
-        dlg = ConfirmOverlay(title, message, btn_yes="확인", btn_no="닫기",
-                             parent=self)
-        dlg.btn_cancel.hide()
-        dlg.exec()
+        self._message(title, message, error=("실패" in title or "오류" in title))
 
     def _auto_scan_tick(self):
         self._scan_wifi(silent=True)
@@ -1340,15 +1352,39 @@ class PageSettingsQml(QWidget):
         if not w:
             return
         cur = w.get_ethernet_status()
-        dlg = _EthernetStaticDialog(current_ip=cur["ip"],
-                                    current_gateway=cur["gateway"], parent=self)
-        if dlg.exec() != QDialog.Accepted:
+        values = {"ip": cur["ip"], "prefix": "24", "gateway": cur["gateway"], "dns": "8.8.8.8"}
+        fields = [("ip", "고정 IP 주소"), ("prefix", "Prefix (예: 24)"),
+                  ("gateway", "Gateway"), ("dns", "DNS")]
+        overlay = self._overlay()
+        if not overlay:
             return
-        res = w.set_ethernet_static(dlg.ip_value, dlg.prefix_value,
-                                    dlg.gateway_value, dlg.dns_value)
+        def ask(pos):
+            if pos >= len(fields):
+                self._apply_eth_static(values)
+                return
+            key, title = fields[pos]
+            overlay.request_text(
+                title, values[key],
+                callback=lambda accepted, value, p=pos, k=key: (
+                    values.__setitem__(k, value.strip()), ask(p + 1)
+                ) if accepted and value.strip() else None,
+            )
+        ask(0)
+
+    def _apply_eth_static(self, values):
+        w = self._ensure_wifi()
+        if not w:
+            return
+        try:
+            prefix = int(values["prefix"])
+        except ValueError:
+            self._show_wifi_msg("실패", "Prefix는 숫자여야 합니다.")
+            return
+        res = w.set_ethernet_static(values["ip"], prefix,
+                                    values["gateway"], values["dns"])
         if res.get("ok") == "1":
             self._show_wifi_msg("고정 IP 적용",
-                                f"{dlg.ip_value}/{dlg.prefix_value} 로 설정했습니다.")
+                                f"{values['ip']}/{prefix} 로 설정했습니다.")
         else:
             self._show_wifi_msg("실패", res.get("error", "알 수 없는 오류"))
         self._refresh_eth_status()

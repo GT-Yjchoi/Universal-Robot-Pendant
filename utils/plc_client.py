@@ -2,12 +2,14 @@ import socket
 import struct
 import threading
 import time
-from PySide6.QtCore import QObject, Signal
+import queue
+from PySide6.QtCore import QObject, Signal, Slot
 
 class PLCClient(QObject):
     sig_connected = Signal(bool)
     sig_monitor_data = Signal(dict)  # 모니터링 데이터 (PLC → HMI)
     sig_error = Signal(str)
+    sig_async_done = Signal(object, object, object)
 
     def __init__(self):
         super().__init__()
@@ -15,7 +17,9 @@ class PLCClient(QObject):
         self.is_connected = False
         self._monitor_running = False
         self._monitor_thread = None
-        self.lock = threading.Lock()
+        # Re-entrant so compound operations (read-modify-write bit updates)
+        # can hold the socket lock across both packets without deadlocking.
+        self.lock = threading.RLock()
         self._last_ip = None
         self._last_port = None
         self._reconnect_running = False
@@ -24,6 +28,12 @@ class PLCClient(QObject):
         self._manual_disconnect = False
         self._last_monitor_data = {}
         self._recipe_transfer_active = False
+        self._command_queue = queue.Queue()
+        self._command_thread = threading.Thread(
+            target=self._command_loop, name="plc-ui-command-queue", daemon=True
+        )
+        self.sig_async_done.connect(self._deliver_async_result)
+        self._command_thread.start()
 
         # --- PLC 통신 설정 ---
         self.USE_HEADER = True      
@@ -33,7 +43,7 @@ class PLCClient(QObject):
 
         # 1. 실시간 모니터링 블록 (PLC → HMI): DT100~
         self.MONITOR_ADDR  = 100
-        self.MONITOR_COUNT = 64
+        self.MONITOR_COUNT = 66
         self.ADDR_USER_ALARM = 159   # DT159: 사용자 알람 (IN 스텝에서 발동, w_UserAlarm)
 
         # 2. 제어 명령 블록 (HMI → PLC): DT200~
@@ -51,6 +61,7 @@ class PLCClient(QObject):
         self.ADDR_SPEED_OVR   = 216  # 전체 속도 배율 (1~10 단계)
         self.heartbeat_value  = 0
         self._heartbeat_skip  = False
+        self._last_heartbeat_at = 0.0
 
         # 3. 시퀀스 데이터 블록: DT20000~ (40슬롯 × 1000 = DT20000~DT59999)
         self.SEQ_BASE_ADDR = 20000
@@ -70,6 +81,36 @@ class PLCClient(QObject):
         # 5. 축 설정 블록: DT15000~ (50 Words)
         self.AXIS_PARAM_ADDR   = 15000
         self.ADDR_AXIS_DATASET = self.AXIS_PARAM_ADDR + 33  # 데이터셋 트리거
+
+    def submit(self, func, *args, callback=None):
+        """Run a PLC operation in the single ordered backend queue.
+
+        The optional callback is delivered on the Qt/UI thread as
+        ``callback(result, error)``.  UI code never needs to wait for TCP.
+        """
+        self._command_queue.put((func, args, callback))
+
+    def _command_loop(self):
+        while True:
+            func, args, callback = self._command_queue.get()
+            result = None
+            error = None
+            try:
+                result = func(*args)
+            except Exception as exc:
+                error = exc
+            if callback is not None:
+                self.sig_async_done.emit(callback, result, error)
+            elif error is not None:
+                print(f"[PLC async command] {error}")
+            self._command_queue.task_done()
+
+    @Slot(object, object, object)
+    def _deliver_async_result(self, callback, result, error):
+        try:
+            callback(result, error)
+        except Exception as exc:
+            print(f"[PLC async callback] {exc}")
 
     def connect_to_plc(self, ip, port):
         """PLC 연결 요청 — 비차단(즉시 반환).
@@ -137,17 +178,14 @@ class PLCClient(QObject):
         if not self.sock or not self.is_connected: 
             return None
         try:
-            length = len(body)
-            # LS PLC 프레임 헤더
-            prefix = b'\x10\x00' + struct.pack('<H', length) + b'\x02\x00\x02\x00\x00\x00'
-            suffix = bytes([0x01, self.DEST_UNIT_NO])
-            packet = prefix + suffix + body
-            
-            self.sock.send(packet)
-            response = self.sock.recv(4096)
-            
-            # 헤더 제거하고 데이터 반환
-            if len(response) > 12: 
+            with self.lock:
+                length = len(body)
+                prefix = b'\x10\x00' + struct.pack('<H', length) + b'\x02\x00\x02\x00\x00\x00'
+                suffix = bytes([0x01, self.DEST_UNIT_NO])
+                packet = prefix + suffix + body
+                self.sock.sendall(packet)
+                response = self.sock.recv(4096)
+            if len(response) > 12:
                 return response[12:]
             return response
         except OSError:
@@ -169,15 +207,12 @@ class PLCClient(QObject):
                 packet = prefix + suffix + body
 
                 t_start = time.time()
-                self.sock.send(packet)
+                self.sock.sendall(packet)
                 response = self.sock.recv(4096)
                 elapsed = (time.time() - t_start) * 1000  # ms
 
                 if elapsed > 30:
                     print(f"[PLC] [!] 응답 지연: {elapsed:.1f}ms")
-
-                # ★ 통신 성공 시 하트비트 업데이트
-                self._update_heartbeat()
 
                 # 헤더 제거하고 데이터 반환
                 if len(response) > 12:
@@ -228,15 +263,17 @@ class PLCClient(QObject):
         return result
 
     def write_bit(self, area_code, addr, bit_pos, on_off):
-        """비트 쓰기"""
-        curr = self.read_words(area_code, addr, 1)
-        if not curr: return
-        val = curr[0]
-        if on_off: 
-            val |= (1 << bit_pos)
-        else:      
-            val &= ~(1 << bit_pos)
-        self.write_words(area_code, addr, [val])
+        """Atomic word read-modify-write for one bit."""
+        with self.lock:
+            curr = self.read_words(area_code, addr, 1)
+            if not curr:
+                return False
+            val = int(curr[0])
+            if on_off:
+                val |= 1 << int(bit_pos)
+            else:
+                val &= ~(1 << int(bit_pos))
+            return bool(self.write_words(area_code, addr, [val]))
 
     def write_dint(self, area_code, addr, value):
         """DINT(32비트) 쓰기"""
@@ -567,7 +604,15 @@ class PLCClient(QObject):
                 except Exception as e:
                     print(f"[PLC] 모니터링 파싱 에러: {e}")
 
-            time.sleep(0.05)  # 50ms 주기
+            # Heartbeat is independent from normal request/response traffic.
+            # Updating it after every packet doubled the 10 ms FP0H Ethernet
+            # transaction cost and also made command latency unpredictable.
+            now = time.monotonic()
+            if now - self._last_heartbeat_at >= 0.5:
+                self._last_heartbeat_at = now
+                self._update_heartbeat()
+
+            time.sleep(0.02)  # response ~10ms + 20ms rest: about 33Hz UI source
         self._monitor_running = False  # 루프 종료 시 플래그 리셋 (재연결 후 재시작 가능하도록)
 
     def _parse_monitor_data(self, raw):
@@ -692,6 +737,8 @@ class PLCClient(QObject):
             raw[62] if len(raw) > 62 else 0,
             raw[63] if len(raw) > 63 else 0,
         ]
+        res['home_request'] = raw[64] if len(raw) > 64 else 0
+        res['home_done'] = bool(raw[65]) if len(raw) > 65 else False
 
         return res
 

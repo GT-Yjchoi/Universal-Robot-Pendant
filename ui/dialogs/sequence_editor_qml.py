@@ -18,7 +18,6 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import QColor
 from PySide6.QtQuickWidgets import QQuickWidget
-from PySide6.QtWidgets import QDialog, QVBoxLayout
 
 from ui.dialogs.sequence_editor_dialog import MONITOR_SEQ_KEY, normalize_all_sequences
 
@@ -37,15 +36,23 @@ def _summary(step: dict, row: int) -> str:
         return f"// {step.get('text', '')}"
     name = step.get("name") or f"{kind} {row + 1}"
     if kind in ("OUT", "IN"):
-        channel = int(step.get("dio_channel", step.get("port", 0)))
+        channel = int(step.get("port", step.get("dio_channel", 0)))
         state = "ON" if step.get("on", True) else "OFF"
-        return f"{name}  ·  {kind}{channel} {state}"
+        group = int(step.get("out_type" if kind == "OUT" else "in_type", 0))
+        labels = ("SYS", "VALVE", "M")
+        return f"{name}  ·  {labels[min(group, 2)]}{channel} {state}"
     if kind == "TMR":
         return f"{name}  ·  {float(step.get('time', 0)):.3f}s"
     if kind == "JMP":
         return f"{name}  ·  → {int(step.get('target_idx', 0)) + 1}"
     if kind == "CALL":
         return f"{name}  ·  {step.get('target_seq', '')}"
+    if kind == "POS":
+        return f"{name}  ·  {step.get('point_name', '')}"
+    if kind == "DAT":
+        ops = ("=", "+=", "-=")
+        op = max(0, min(2, int(step.get("dat_op", 0))))
+        return f"{name}  ·  DT{int(step.get('dat_dt_addr', 60000))} {ops[op]} {int(step.get('dat_const', 0))}"
     return str(name)
 
 
@@ -97,10 +104,11 @@ class SequenceEditorBackend(QObject):
     acceptRequested = Signal()
     rejectRequested = Signal()
 
-    def __init__(self, sequences, timer_library, model, parent=None):
+    def __init__(self, sequences, timer_library, position_points, model, parent=None):
         super().__init__(parent)
         self.sequences = sequences
         self.timer_library = timer_library
+        self.position_points = position_points
         self.model = model
         self.current_sequence = "Main" if "Main" in sequences else next(iter(sequences))
         self.selected_row = -1
@@ -128,11 +136,33 @@ class SequenceEditorBackend(QObject):
         return str(step.get("text", "") if step.get("type") == "COMMENT" else step.get("name", ""))
     def _channel(self):
         step = self._selected()
-        return max(0, min(7, int(step.get("dio_channel", step.get("port", 0))))) if step else 0
+        if not step: return 0
+        value = int(step.get("port", step.get("dio_channel", 0)))
+        kind = int(step.get("out_type" if step.get("type") == "OUT" else "in_type", 0))
+        if step.get("type") == "IN":
+            if kind == 1 and value >= 32: value -= 32
+            if kind == 2 and value >= 100: value -= 100
+        return max(0, min(31, value))
+    def _io_type(self):
+        step = self._selected(); key = "out_type" if step.get("type") == "OUT" else "in_type"
+        return max(0, min(2, int(step.get(key, 0)))) if step else 0
     def _on(self): return bool(self._selected().get("on", True))
     def _seconds(self): return float(self._selected().get("time", 1.0)) if self._selected() else 1.0
     def _target_index(self): return int(self._selected().get("target_idx", 0)) if self._selected() else 0
     def _target_sequence(self): return str(self._selected().get("target_seq", ""))
+    def _point_keys(self): return sorted(self.position_points.keys())
+    def _point_index(self):
+        keys = self._point_keys(); value = str(self._selected().get("point_name", ""))
+        return keys.index(value) if value in keys else -1
+    def _bool(self, key, default=False): return bool(self._selected().get(key, default))
+    def _float(self, key, default=0.0): return float(self._selected().get(key, default))
+    def _int(self, key, default=0): return int(self._selected().get(key, default))
+    def _timeout_action_index(self):
+        return {"continue": 0, "ask": 1, "alarm_go": 2}.get(str(self._selected().get("timeout_action", "continue")), 0)
+    def _cond_type_index(self):
+        return ["INPUT", "VALVE", "BIT", "MODE", "STATE", "DTCMP"].index(
+            str(self._selected().get("cond_type", "INPUT")).upper()
+        ) if str(self._selected().get("cond_type", "INPUT")).upper() in ["INPUT", "VALVE", "BIT", "MODE", "STATE", "DTCMP"] else 0
     def _step_targets(self): return [_summary(s, i) for i, s in enumerate(self.model.steps)]
     def _target_seq_index(self):
         keys = [k for k in self._keys() if k != self.current_sequence]
@@ -145,6 +175,7 @@ class SequenceEditorBackend(QObject):
     selectedType = Property(str, _kind, notify=selectionChanged)
     selectedName = Property(str, _name, notify=selectionChanged)
     selectedChannel = Property(int, _channel, notify=selectionChanged)
+    selectedIoType = Property(int, _io_type, notify=selectionChanged)
     selectedOn = Property(bool, _on, notify=selectionChanged)
     selectedSeconds = Property(float, _seconds, notify=selectionChanged)
     selectedTargetIndex = Property(int, _target_index, notify=selectionChanged)
@@ -152,6 +183,26 @@ class SequenceEditorBackend(QObject):
     stepTargets = Property(list, _step_targets, notify=changed)
     targetSequenceKeys = Property(list, lambda self: [k for k in self._keys() if k != self.current_sequence], notify=changed)
     targetSequenceIndex = Property(int, _target_seq_index, notify=selectionChanged)
+    pointKeys = Property(list, _point_keys, notify=changed)
+    selectedPointIndex = Property(int, _point_index, notify=selectionChanged)
+    selectedWaitCompletion = Property(bool, lambda s: s._bool("wait_completion", True), notify=selectionChanged)
+    selectedPackBase = Property(bool, lambda s: s._bool("pack_base"), notify=selectionChanged)
+    selectedDelayEnabled = Property(bool, lambda s: s._bool("delay_enable"), notify=selectionChanged)
+    selectedDelaySeconds = Property(float, lambda s: s._float("delay_time"), notify=selectionChanged)
+    selectedTimeoutEnabled = Property(bool, lambda s: s._bool("timeout_enabled"), notify=selectionChanged)
+    selectedTimeoutSeconds = Property(float, lambda s: s._float("timeout", 5.0), notify=selectionChanged)
+    selectedTimeoutAction = Property(int, _timeout_action_index, notify=selectionChanged)
+    selectedParallel = Property(bool, lambda s: s._bool("parallel"), notify=selectionChanged)
+    selectedConditional = Property(bool, lambda s: s._bool("condition"), notify=selectionChanged)
+    selectedCondType = Property(int, _cond_type_index, notify=selectionChanged)
+    selectedCondValue = Property(int, lambda s: s._int("cond_value"), notify=selectionChanged)
+    selectedCondOn = Property(bool, lambda s: s._bool("cond_on", True), notify=selectionChanged)
+    selectedCmpAddress = Property(int, lambda s: s._int("cmp_dt_addr", 60000), notify=selectionChanged)
+    selectedCmpOp = Property(int, lambda s: s._int("cmp_op", 0), notify=selectionChanged)
+    selectedCmpConst = Property(int, lambda s: s._int("cmp_const"), notify=selectionChanged)
+    selectedDatAddress = Property(int, lambda s: s._int("dat_dt_addr", 60000), notify=selectionChanged)
+    selectedDatOp = Property(int, lambda s: s._int("dat_op", 0), notify=selectionChanged)
+    selectedDatConst = Property(int, lambda s: s._int("dat_const"), notify=selectionChanged)
 
     def _notify_row(self):
         self.model.refresh(self.selected_row)
@@ -204,10 +255,20 @@ class SequenceEditorBackend(QObject):
         count = sum(1 for s in self.model.steps if s.get("type") == kind) + 1
         data = {"type": kind, "name": f"{kind}_{count}"}
         if kind in ("OUT", "IN"):
-            data.update({"dio_channel": 0, "port": 0, "on": True})
+            data.update({"port": 0, "on": True,
+                         "out_type" if kind == "OUT" else "in_type": 0})
+            if kind == "OUT": data["delay_enable"] = False
+            else: data.update({"timeout_enabled": False, "timeout_action": "continue"})
+        elif kind == "POS":
+            data.update({"point_name": self._point_keys()[0] if self._point_keys() else "",
+                         "active_axes": [True] * 8, "wait_completion": True})
         elif kind == "TMR": data["time"] = 1.0
-        elif kind == "JMP": data.update({"target_idx": 0, "condition": False})
-        elif kind == "CALL": data["target_seq"] = ""
+        elif kind == "JMP": data.update({"target_idx": 0, "condition": False,
+                                          "cond_type": "INPUT", "cond_value": 0,
+                                          "cond_on": True, "cmp_dt_addr": 60000,
+                                          "cmp_op": 0, "cmp_const": 0})
+        elif kind == "CALL": data.update({"target_seq": "", "parallel": False})
+        elif kind == "DAT": data.update({"dat_dt_addr": 60000, "dat_op": 0, "dat_const": 0})
         elif kind == "COMMENT": data = {"type": "COMMENT", "text": "메모"}
         elif kind == "END": data["name"] = "END"
         self.model.beginInsertRows(QModelIndex(), len(self.model.steps), len(self.model.steps))
@@ -247,9 +308,21 @@ class SequenceEditorBackend(QObject):
     def setChannel(self, channel):
         step = self._selected()
         if not step: return
-        step["dio_channel"] = max(0, min(7, int(channel)))
-        step["port"] = step["dio_channel"]
+        kind = self._io_type(); logical = max(0, min(31 if kind == 2 else 15, int(channel)))
+        if step.get("type") == "IN":
+            step["port"] = logical + (32 if kind == 1 else 100 if kind == 2 else 0)
+        else:
+            step["port"] = logical
+        step.pop("dio_channel", None)
         self._notify_row()
+
+    @Slot(int)
+    def setIoType(self, kind):
+        step = self._selected()
+        if not step or step.get("type") not in ("OUT", "IN"): return
+        logical = self._channel(); kind = max(0, min(2, int(kind)))
+        step["out_type" if step.get("type") == "OUT" else "in_type"] = kind
+        self.setChannel(logical)
 
     @Slot(bool)
     def setOn(self, enabled):
@@ -269,6 +342,58 @@ class SequenceEditorBackend(QObject):
         if self._selected() and 0 <= index < len(keys):
             self._selected()["target_seq"] = keys[index]; self._notify_row()
 
+    @Slot(int)
+    def setPointIndex(self, index):
+        keys = self._point_keys()
+        if self._selected() and 0 <= index < len(keys): self._selected()["point_name"] = keys[index]; self._notify_row()
+    @Slot(int, bool)
+    def setAxisActive(self, index, enabled):
+        step = self._selected(); axes = list(step.get("active_axes", [True] * 8)) if step else []
+        while len(axes) < 8: axes.append(True)
+        if 0 <= index < 8: axes[index] = bool(enabled); step["active_axes"] = axes; self._notify_row()
+    @Slot(int, result=bool)
+    def axisActive(self, index):
+        axes = list(self._selected().get("active_axes", [True] * 8)); return bool(axes[index]) if 0 <= index < len(axes) else True
+    @Slot(bool)
+    def setWaitCompletion(self, value): self._selected()["wait_completion"] = bool(value); self._notify_row()
+    @Slot(bool)
+    def setPackBase(self, value):
+        if value: self._selected()["pack_base"] = True
+        else: self._selected().pop("pack_base", None)
+        self._notify_row()
+    @Slot(bool)
+    def setDelayEnabled(self, value): self._selected()["delay_enable"] = bool(value); self._notify_row()
+    @Slot(float)
+    def setDelaySeconds(self, value): self._selected()["delay_time"] = max(0.0, float(value)); self._notify_row()
+    @Slot(bool)
+    def setTimeoutEnabled(self, value): self._selected()["timeout_enabled"] = bool(value); self._notify_row()
+    @Slot(float)
+    def setTimeoutSeconds(self, value): self._selected()["timeout"] = max(0.0, float(value)); self._notify_row()
+    @Slot(int)
+    def setTimeoutAction(self, index): self._selected()["timeout_action"] = ("continue", "ask", "alarm_go")[max(0, min(2, index))]; self._notify_row()
+    @Slot(bool)
+    def setParallel(self, value): self._selected()["parallel"] = bool(value); self._notify_row()
+    @Slot(bool)
+    def setConditional(self, value): self._selected()["condition"] = bool(value); self._notify_row()
+    @Slot(int)
+    def setCondType(self, index): self._selected()["cond_type"] = ("INPUT", "VALVE", "BIT", "MODE", "STATE", "DTCMP")[max(0, min(5, index))]; self._notify_row()
+    @Slot(int)
+    def setCondValue(self, value): self._selected()["cond_value"] = int(value); self._notify_row()
+    @Slot(bool)
+    def setCondOn(self, value): self._selected()["cond_on"] = bool(value); self._notify_row()
+    @Slot(int)
+    def setCmpAddress(self, value): self._selected()["cmp_dt_addr"] = max(60000, min(60099, int(value))); self._notify_row()
+    @Slot(int)
+    def setCmpOp(self, value): self._selected()["cmp_op"] = max(0, min(5, int(value))); self._notify_row()
+    @Slot(int)
+    def setCmpConst(self, value): self._selected()["cmp_const"] = max(-32768, min(32767, int(value))); self._notify_row()
+    @Slot(int)
+    def setDatAddress(self, value): self._selected()["dat_dt_addr"] = max(60000, min(60099, int(value))); self._notify_row()
+    @Slot(int)
+    def setDatOp(self, value): self._selected()["dat_op"] = max(0, min(2, int(value))); self._notify_row()
+    @Slot(int)
+    def setDatConst(self, value): self._selected()["dat_const"] = max(-32768, min(32767, int(value))); self._notify_row()
+
     @Slot()
     def save(self): self.acceptRequested.emit()
 
@@ -276,13 +401,14 @@ class SequenceEditorBackend(QObject):
     def cancel(self): self.rejectRequested.emit()
 
 
-class SequenceEditorQmlDialog(QDialog):
+class SequenceEditorQmlDialog(QQuickWidget):
+    """Full-screen QML editor hosted as a child scene, without a modal event loop."""
+
     def __init__(self, sequence_data=None, position_points=None, timer_library=None,
                  plc_client=None, mode_data=None, parent=None):
-        super().__init__(parent)
-        self.setModal(True)
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog | Qt.WindowStaysOnTopHint)
-        self.setWindowState(Qt.WindowFullScreen)
+        host = parent.window() if parent is not None else None
+        super().__init__(host)
+        self._finished_callback = None
         self.timer_library = timer_library if timer_library is not None else {}
         self.points_library = copy.deepcopy(position_points or {})
         if isinstance(sequence_data, dict): self.sequences = copy.deepcopy(sequence_data)
@@ -292,16 +418,37 @@ class SequenceEditorQmlDialog(QDialog):
         normalize_all_sequences(self.sequences, self.timer_library)
 
         self.model = StepListModel(self)
-        self.backend = SequenceEditorBackend(self.sequences, self.timer_library, self.model, self)
-        self.backend.acceptRequested.connect(self.accept)
-        self.backend.rejectRequested.connect(self.reject)
-        self.view = QQuickWidget(self)
-        self.view.setResizeMode(QQuickWidget.SizeRootObjectToView)
-        self.view.setClearColor(QColor("#0F161E"))
-        self.view.rootContext().setContextProperty("stepModel", self.model)
-        self.view.rootContext().setContextProperty("seqEditor", self.backend)
-        self.view.setSource(QUrl.fromLocalFile(_QML_PATH))
-        layout = QVBoxLayout(self); layout.setContentsMargins(0, 0, 0, 0); layout.addWidget(self.view)
+        self.backend = SequenceEditorBackend(self.sequences, self.timer_library,
+                                             self.points_library, self.model, self)
+        self.backend.acceptRequested.connect(lambda: self._finish(True))
+        self.backend.rejectRequested.connect(lambda: self._finish(False))
+        self.setResizeMode(QQuickWidget.SizeRootObjectToView)
+        self.setClearColor(QColor("#0F161E"))
+        self.setAttribute(Qt.WA_AlwaysStackOnTop, True)
+        self.rootContext().setContextProperty("stepModel", self.model)
+        self.rootContext().setContextProperty("seqEditor", self.backend)
+        self.setSource(QUrl.fromLocalFile(_QML_PATH))
+        self.hide()
+
+    @property
+    def view(self):
+        """Compatibility alias used by smoke checks."""
+        return self
+
+    def open(self, callback=None):
+        self._finished_callback = callback
+        if self.parentWidget() is not None:
+            self.resize(self.parentWidget().size())
+        self.show()
+        self.raise_()
+        self.setFocus(Qt.OtherFocusReason)
+
+    def _finish(self, accepted):
+        callback, self._finished_callback = self._finished_callback, None
+        self.hide()
+        if callback is not None:
+            callback(bool(accepted), self)
+        self.deleteLater()
 
     def get_sequence_data(self): return self.sequences
     def get_position_points(self): return self.points_library

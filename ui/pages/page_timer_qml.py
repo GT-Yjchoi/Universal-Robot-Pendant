@@ -9,15 +9,8 @@ import time
 from PySide6.QtCore import (Qt, QObject, Signal, Slot, Property, QUrl, QTimer,
                             QAbstractListModel, QModelIndex, QByteArray)
 from PySide6.QtGui import QColor
-from PySide6.QtWidgets import QVBoxLayout, QWidget, QDialog
+from PySide6.QtWidgets import QVBoxLayout, QWidget
 from PySide6.QtQuickWidgets import QQuickWidget
-
-from ui.pages.page_timer import TimerEditDialog   # 편집창 재사용
-
-try:
-    from ui.dialogs.sequence_utils import TimerReorderDialog
-except ImportError:
-    TimerReorderDialog = None
 
 _QML_PATH = os.path.join(os.path.dirname(__file__), "PageTimer.qml")
 _R_NAME = Qt.UserRole + 1
@@ -101,6 +94,7 @@ class PageTimerQml(QWidget):
         self._highlight_min_sec = 0.5
         self._active_min_end = 0.0
         self._active_queue = []
+        self._pending_monitor = None
 
         self._blink_timer = QTimer(self)
         self._blink_timer.setInterval(500)
@@ -137,15 +131,16 @@ class PageTimerQml(QWidget):
     def showEvent(self, event):
         super().showEvent(event)
         QTimer.singleShot(0, self.refresh_grid)
+        if self._pending_monitor is not None:
+            data, self._pending_monitor = self._pending_monitor, None
+            QTimer.singleShot(0, lambda d=data: self._on_monitor_data(d))
 
     # ---- 편집 (PageTimer._on_card_clicked) ----
     def _on_card_clicked(self, name):
         time_sec = self.timer_library.get(name, 0.0)
-        current_ms = int(self.timer_library.get(name, time_sec) * 100)
-        dlg = TimerEditDialog(name, current_ms, self)
-        if dlg.exec() == TimerEditDialog.Accepted:
-            new_ms = dlg.get_value_ms()
-            new_sec = new_ms / 100.0
+        def finished(accepted, value):
+            if not accepted: return
+            new_sec = round(float(value), 2)
             old_sec = self.timer_library.get(name, time_sec)
             self.timer_library[name] = new_sec
             self._model.update_one(name)
@@ -156,70 +151,59 @@ class PageTimerQml(QWidget):
                 op_record("TIMER", f"타이머 '{name}' {old_sec:.2f}s → {new_sec:.2f}s")
             except Exception:
                 pass
+        self.window().qml_overlay.request_number(
+            f"타이머: {name}", time_sec, decimal=True, minimum=0, maximum=99999,
+            callback=finished,
+        )
 
-    # ---- PageTimer._sync_steps_time 와 동일 (PLC patch) ----
+    # ---- Update pendant-owned recipe references only ----
     def _sync_steps_time(self, timer_name, new_sec):
-        MONITOR_KEY = "Monitor"
-        seq_map = {"Main": 0, MONITOR_KEY: 39}
-        reserved = set(seq_map.keys())
-        subs = sorted([k for k in self.sequence_data.keys() if k not in reserved])
-        for i, k in enumerate(subs):
-            seq_map[k] = i + 1
-        plc = self.plc_client
         patch_count = 0
-        try:
-            from ui.dialogs.sequence_editor_dialog import normalize_step
-        except Exception:
-            normalize_step = None
-        for seq_name, steps in self.sequence_data.items():
+        for steps in self.sequence_data.values():
             if not isinstance(steps, list):
                 continue
-            slot_id = seq_map.get(seq_name)
-            plc_idx = 0
             for step in steps:
                 if step.get("type") == "COMMENT":
                     continue
                 if step.get("type") == "TMR" and step.get("timer_ref") == timer_name:
                     step["time"] = new_sec
-                    if plc and getattr(plc, 'is_connected', False) and slot_id is not None:
-                        if normalize_step:
-                            normalize_step(step, self.timer_library)
-                        plc.patch_sequence_step(slot_id, plc_idx, step)
                     patch_count += 1
                 elif step.get("type") == "OUT" and step.get("delay_timer_ref") == timer_name:
                     step["delay_time"] = new_sec
-                    if plc and getattr(plc, 'is_connected', False) and slot_id is not None:
-                        if normalize_step:
-                            normalize_step(step, self.timer_library)
-                        plc.patch_sequence_step(slot_id, plc_idx, step)
                     patch_count += 1
-                plc_idx += 1
         if patch_count:
-            print(f"[Timer Library] Synced+StepPatched {patch_count} step(s) referencing '{timer_name}'")
+            print(f"[Timer Library] Synced {patch_count} pendant step(s) referencing '{timer_name}'")
         self.sig_timer_changed.emit()
 
     def _on_reorder_clicked(self):
-        if not self.timer_library or not TimerReorderDialog:
+        if not self.timer_library:
             return
-        dlg = TimerReorderDialog(list(self.timer_library.keys()), parent=self)
-        if dlg.exec() != QDialog.Accepted:
-            return
-        new_order = dlg.get_ordered_names()
-        reordered = {n: self.timer_library[n] for n in new_order
-                     if n in self.timer_library}
-        self.timer_library.clear()
-        self.timer_library.update(reordered)
-        self.refresh_grid()
+        def finished(accepted, new_order):
+            if not accepted: return
+            reordered = {n: self.timer_library[n] for n in new_order if n in self.timer_library}
+            self.timer_library.clear(); self.timer_library.update(reordered)
+            self.refresh_grid(); self.sig_timer_changed.emit()
+        self.window().qml_overlay.request_reorder(
+            "타이머 순서 변경", list(self.timer_library.keys()), callback=finished,
+        )
 
     # ---- 실시간 active (PageTimer 와 동일 로직) ----
     def _on_monitor_data(self, data):
         if not isinstance(data, dict):
             return
+        if not self.isVisible():
+            self._pending_monitor = dict(data)
+            if self._blink_timer.isActive():
+                self._blink_timer.stop()
+            return
         op_status = data.get('op_status', 0)
         current_slot = data.get('sub_seq_idx', 0)
         current_step = data.get('current_step', 0)
         if op_status in (1, 2):
-            active = self._find_active_timer(current_slot, current_step)
+            if data.get("pendant_sequence"):
+                active = self._find_active_timer(data.get("local_sequence", "Main"), current_step)
+            else:
+                active = self._find_active_timer(current_slot, current_step)
         else:
             active = None
         self._handle_active_change(active)
@@ -258,7 +242,9 @@ class PageTimerQml(QWidget):
             self._show_active(None)
 
     def _find_active_timer(self, current_slot, step_idx):
-        if current_slot == 0:
+        if isinstance(current_slot, str):
+            seq_name = current_slot
+        elif current_slot == 0:
             seq_name = "Main"
         elif current_slot == 39:
             seq_name = "Monitor"

@@ -294,24 +294,7 @@ class ValveBackend(QObject):
         if self._locked:
             return
         if self.plc_client and self.plc_client.is_connected:
-            try:
-                dt_addr, bit_pos = self._valve_dt_addr(bit_index)
-                print(f"[ValvePanel] toggle request bit={bit_index} DT{dt_addr} bit{bit_pos} checked={checked}")
-                data = self.plc_client.read_words(0x09, dt_addr, 1)
-                if data and len(data) >= 1:
-                    current_value = data[0]
-                    if checked:
-                        new_value = current_value | (1 << bit_pos)
-                    else:
-                        new_value = current_value & ~(1 << bit_pos)
-                    result = self.plc_client.write_words(0x09, dt_addr, [new_value & 0xFFFF])
-                    print(f"[ValvePanel] 밸브 {bit_index} (DT{dt_addr} bit{bit_pos}) {'ON' if checked else 'OFF'} "
-                          f"{current_value:#06x}->{new_value & 0xFFFF:#06x} write={'OK' if result else 'FAIL'}")
-                    self._log_valve_op(bit_index, "ON" if checked else "OFF")
-                else:
-                    print(f"[ValvePanel] read failed DT{dt_addr} for bit={bit_index}")
-            except Exception as e:
-                print(f"[ValvePanel] 밸브 제어 실패: {e}")
+            self.plc_client.submit(self._write_valve_state, bit_index, bool(checked), True)
         # 낙관적 표시 (실제 상태는 다음 monitor sync 가 확정)
         self._model.set_checked_by_bit(bit_index, checked)
 
@@ -320,31 +303,21 @@ class ValveBackend(QObject):
         if self._locked:
             return
         if self.plc_client and self.plc_client.is_connected:
-            try:
-                dt_addr, bit_pos = self._valve_dt_addr(bit_index)
-                data = self.plc_client.read_words(0x09, dt_addr, 1)
-                if data and len(data) >= 1:
-                    new_value = data[0] | (1 << bit_pos)
-                    self.plc_client.write_words(0x09, dt_addr, [new_value & 0xFFFF])
-                    print(f"[ValvePanel] 밸브 {bit_index} (DT{dt_addr} bit{bit_pos}) 누름 (ON)")
-                    self._log_valve_op(bit_index, "모멘터리 ON")
-            except Exception as e:
-                print(f"[ValvePanel] 밸브 제어 실패: {e}")
+            self.plc_client.submit(self._write_valve_state, bit_index, True, True)
 
     @Slot(int)
     def valveReleased(self, bit_index):
         if self._locked:
             return
         if self.plc_client and self.plc_client.is_connected:
-            try:
-                dt_addr, bit_pos = self._valve_dt_addr(bit_index)
-                data = self.plc_client.read_words(0x09, dt_addr, 1)
-                if data and len(data) >= 1:
-                    new_value = data[0] & ~(1 << bit_pos)
-                    self.plc_client.write_words(0x09, dt_addr, [new_value & 0xFFFF])
-                    print(f"[ValvePanel] 밸브 {bit_index} (DT{dt_addr} bit{bit_pos}) 뗌 (OFF)")
-            except Exception as e:
-                print(f"[ValvePanel] 밸브 제어 실패: {e}")
+            self.plc_client.submit(self._write_valve_state, bit_index, False, False)
+
+    def _write_valve_state(self, bit_index, enabled, log_operation):
+        dt_addr, bit_pos = self._valve_dt_addr(bit_index)
+        if not self.plc_client.write_bit(0x09, dt_addr, bit_pos, enabled):
+            raise ConnectionError(f"valve bit update failed: DT{dt_addr}.{bit_pos}")
+        if log_operation:
+            self._log_valve_op(bit_index, "ON" if enabled else "OFF")
 
     def sync_from_outputs(self, outputs):
         # ValvePanel._sync_toggle_buttons 와 동일 (DT120/121 비대칭 보존)
@@ -436,12 +409,11 @@ class PageManualQml(QWidget):
                 self._valve_be.sync_from_outputs(outs)
 
     def _refresh_axis_visibility(self):
-        if not self.plc_client or not self.plc_client.is_connected:
-            return
         try:
-            d = self.plc_client.read_words(0x09, self.plc_client.AXIS_PARAM_ADDR, 1)
-            if d:
-                self._axis.set_visibility(d[0])
+            from utils.json_utils import load_json
+            uses = (load_json(get_settings_path()) or {}).get("axis_uses", [True] * 8)
+            mask = sum((1 << i) for i, enabled in enumerate(uses[:8]) if enabled)
+            self._axis.set_visibility(mask)
         except Exception as e:
             print(f"Axis Config Load Error: {e}")
 

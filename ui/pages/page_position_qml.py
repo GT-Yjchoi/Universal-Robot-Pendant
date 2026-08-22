@@ -1,8 +1,7 @@
 """
 위치설정 페이지 QML(GPU) — PagePosition drop-in.
-UI/스크롤만 QML. teach·값편집·미세조정·PLC write·실시간추종/하이라이트·
-포인트네비·시퀀스편집기 로직은 PagePosition 과 동일(verbatim).
-오버레이/다이얼로그·ValveBackend 재사용.
+화면, 미세조정, 선택, 재정렬 및 전체 화면 시퀀스 편집기는 QML로 렌더링한다.
+티칭·실시간 추종·레시피 변경과 통신 로직은 Python 백엔드에 유지한다.
 
 ⚠ teach/값→PLC 포인트메모리 기록 경로는 실장비에서 정확도 검증 필수.
 """
@@ -11,11 +10,9 @@ import os
 from PySide6.QtCore import (Qt, QObject, Signal, Slot, Property, QUrl, QTimer,
                             QAbstractListModel, QModelIndex, QByteArray)
 from PySide6.QtGui import QColor
-from PySide6.QtWidgets import QVBoxLayout, QWidget, QDialog
+from PySide6.QtWidgets import QVBoxLayout, QWidget
 from PySide6.QtQuickWidgets import QQuickWidget
 
-from ui.pages.page_position import (NumberInputOverlay, FineAdjustOverlay,
-                                    PointNameCardOverlay, PositionOrderDialog)
 from ui.dialogs.sequence_editor_qml import SequenceEditorQmlDialog
 from ui.pages.page_manual_qml import ValveModel, ValveBackend
 
@@ -534,15 +531,21 @@ class PagePositionQml(QWidget):
             current_val_str = self._axis.sav[row_idx]
         else:
             current_val_str = self._axis.spd[row_idx]
-        prec = 3 if col_type == "coords" else 0
-        dlg = NumberInputOverlay(current_val_str, prec, parent=self.window())
-        new_val_str = dlg.exec()
-        if new_val_str is None:
-            return
-        try:
-            new_val = float(new_val_str)
-        except ValueError:
-            return
+        def finished(accepted, value):
+            if accepted: self._apply_edited_value(selected_point, row_idx, col_type, value)
+        if col_type == "coords":
+            from utils.axis_limits import get_axis_strokes
+            maximum = get_axis_strokes()[row_idx] if 0 <= row_idx < 8 else 1000.0
+        else:
+            maximum = 100
+        self.window().qml_overlay.request_number(
+            f"{selected_point} {_AXES[row_idx]} {col_type}", float(current_val_str),
+            decimal=col_type == "coords", minimum=0 if col_type == "coords" else 1,
+            maximum=maximum, callback=finished,
+        )
+
+    def _apply_edited_value(self, selected_point, row_idx, col_type, new_val):
+        new_val = float(new_val)
         if col_type == "speed":
             try:
                 old_speed = int(float(self._axis.spd[row_idx]))
@@ -553,14 +556,11 @@ class PagePositionQml(QWidget):
             from utils.axis_limits import get_axis_strokes
             stroke = get_axis_strokes()[row_idx] if 0 <= row_idx < 8 else 1000.0
             if new_val < 0.0 or new_val > stroke:
-                try:
-                    from ui.dialogs.sequence_utils import DarkMessageDialog
-                    DarkMessageDialog(
-                        "입력 범위 초과",
-                        f"스트로크 한계를 벗어났습니다.\n허용 범위: 0 ~ {stroke:.3f} mm\n입력값: {new_val:.3f} mm",
-                        is_error=True, parent=self.window()).exec()
-                except Exception as e:
-                    print(f"[Position] 범위초과 팝업 실패: {e}")
+                self.window().qml_overlay.show_message(
+                    "입력 범위 초과",
+                    f"스트로크 한계를 벗어났습니다.\n허용 범위: 0 ~ {stroke:.3f} mm\n입력값: {new_val:.3f} mm",
+                    error=True,
+                )
                 return
         if col_type == "coords":
             self.position_points[selected_point]["coords"][row_idx] = new_val
@@ -574,19 +574,6 @@ class PagePositionQml(QWidget):
             if "speeds" not in self.position_points[selected_point]:
                 self.position_points[selected_point]["speeds"] = [100] * 8
             self.position_points[selected_point]["speeds"][row_idx] = new_val
-        if self.plc_client and self.plc_client.is_connected:
-            try:
-                sorted_names = sorted(list(self.position_points.keys()))
-                point_idx = sorted_names.index(selected_point)
-                base_addr = self.plc_client.POINT_BASE_ADDR + (point_idx * self.plc_client.POINT_SIZE)
-                if col_type == "coords":
-                    target_addr = base_addr + 2 + (row_idx * 2)
-                    self.plc_client.write_dint(0x09, target_addr, int(new_val * 1000))
-                elif col_type == "speed":
-                    target_addr = base_addr + 18 + row_idx
-                    self.plc_client.write_words(0x09, target_addr, [int(new_val)])
-            except Exception as e:
-                print(f"[Position] PLC 시퀀스 값 전송 실패: {e}")
         self._load_selected_point()
         self.sig_sequence_changed.emit()
         try:
@@ -603,14 +590,14 @@ class PagePositionQml(QWidget):
         coords = self.position_points[selected_point].setdefault("coords", [0.0] * 8)
         cur = coords[row_idx] if row_idx < len(coords) else 0.0
         axis_name = _AXES[row_idx] if 0 <= row_idx < 8 else f"{row_idx+1}"
-        overlay = FineAdjustOverlay(axis_name, cur, on_adjust=None, parent=self)
+        from utils.axis_limits import get_axis_strokes
+        stroke = get_axis_strokes()[row_idx] if 0 <= row_idx < 8 else 1000.0
+        self.window().qml_overlay.request_fine_adjust(
+            f"{axis_name}축 미세조정", cur, 0, stroke,
+            callback=lambda delta: self._apply_fine_adjust(selected_point, row_idx, delta),
+        )
 
-        def _apply(delta):
-            self._apply_fine_adjust(selected_point, row_idx, delta, overlay)
-        overlay._on_adjust = _apply
-        overlay.exec()
-
-    def _apply_fine_adjust(self, selected_point, row_idx, delta, overlay):
+    def _apply_fine_adjust(self, selected_point, row_idx, delta):
         if selected_point not in self.position_points:
             return
         coords = self.position_points[selected_point].setdefault("coords", [0.0] * 8)
@@ -619,12 +606,11 @@ class PagePositionQml(QWidget):
         from utils.axis_limits import get_axis_strokes
         stroke = get_axis_strokes()[row_idx] if 0 <= row_idx < 8 else 1000.0
         if new_val < 0.0 or new_val > stroke:
-            from ui.dialogs.sequence_utils import DarkMessageDialog
-            DarkMessageDialog(
+            self.window().qml_overlay.show_message(
                 "입력 범위 초과",
-                f"스트로크 한계를 벗어났습니다.\n허용 범위: 0 ~ {stroke:.3f} mm\n입력값: {new_val:.3f} mm",
-                is_error=True, parent=self.window()).exec()
-            return
+                f"스트로크 한계를 벗어났습니다.\n허용 범위: 0 ~ {stroke:.3f} mm\n입력값: {new_val:.3f} mm", error=True,
+            )
+            return None
         coords[row_idx] = new_val
         for seq in self.sequences.values():
             for step in seq:
@@ -632,18 +618,7 @@ class PagePositionQml(QWidget):
                     p_name = step.get("point_name", step.get("name"))
                     if p_name == selected_point and "coords" in step:
                         step["coords"][row_idx] = new_val
-        if self.plc_client and self.plc_client.is_connected:
-            try:
-                sorted_names = sorted(list(self.position_points.keys()))
-                point_idx = sorted_names.index(selected_point)
-                base_addr = self.plc_client.POINT_BASE_ADDR + (point_idx * self.plc_client.POINT_SIZE)
-                target_addr = base_addr + 2 + (row_idx * 2)
-                self.plc_client.write_dint(0x09, target_addr, int(new_val * 1000))
-            except Exception as e:
-                print(f"[Position] 미세조정 PLC 전송 실패: {e}")
         self._axis.set_one(row_idx, sav=f"{new_val:.3f}")
-        if overlay is not None:
-            overlay.set_value(new_val)
         self.sig_sequence_changed.emit()
         try:
             from utils.op_history import record as op_record
@@ -651,6 +626,7 @@ class PagePositionQml(QWidget):
             op_record("POS", f"(자동중) {selected_point} {axis}축 미세조정 {delta:+g} → {new_val:.3f} mm")
         except Exception:
             pass
+        return new_val
 
     # ---- teach (PagePosition._on_teach_clicked 와 동일) ----
     def _on_teach_clicked(self):
@@ -674,16 +650,6 @@ class PagePositionQml(QWidget):
                     p_name = step.get("point_name", step.get("name"))
                     if p_name == target_point_name:
                         step["coords"] = list(new_coords)
-        if self.plc_client and self.plc_client.is_connected:
-            try:
-                sorted_names = sorted(list(self.position_points.keys()))
-                point_idx = sorted_names.index(target_point_name)
-                base_addr = self.plc_client.POINT_BASE_ADDR + (point_idx * self.plc_client.POINT_SIZE)
-                for i, val in enumerate(new_coords):
-                    target_addr = base_addr + 2 + (i * 2)
-                    self.plc_client.write_dint(0x09, target_addr, int(val * 1000))
-            except Exception as e:
-                print(f"[Position] PLC 포지션 값 전송 실패: {e}")
         self._load_selected_point()
         self.sig_sequence_changed.emit()
         if self._pt_index + 1 < len(self._visible_points):
@@ -697,11 +663,11 @@ class PagePositionQml(QWidget):
             return
         ordered = list(self._visible_points)
         current = self._point_name()
-        overlay = PointNameCardOverlay(ordered, current, parent=self)
-        overlay.point_selected.connect(self._on_point_selected_from_card)
-        overlay.show()
-        overlay.raise_()
-        overlay.activateWindow()
+        current_index = ordered.index(current) if current in ordered else -1
+        self.window().qml_overlay.request_selection(
+            "포인트 선택", ordered, current_index,
+            callback=lambda accepted, index, name: self._on_point_selected_from_card(name) if accepted else None,
+        )
 
     def _on_point_selected_from_card(self, name):
         if name in self._visible_points:
@@ -710,13 +676,15 @@ class PagePositionQml(QWidget):
             self._be.changed.emit()
 
     def _on_reorder_clicked(self):
-        dlg = PositionOrderDialog(self.view_order_data, self)
-        if dlg.exec() == QDialog.Accepted:
-            new_order = dlg.get_ordered_names()
+        def finished(accepted, new_order):
+            if not accepted: return
             self.view_order_data.clear()
             self.view_order_data.extend(new_order)
             self._refresh_ui()
             self.sig_sequence_changed.emit()
+        self.window().qml_overlay.request_reorder(
+            "포인트 순서 변경", list(self.view_order_data), callback=finished,
+        )
 
     def _open_sequence_editor(self):
         dlg = SequenceEditorQmlDialog(
@@ -726,9 +694,11 @@ class PagePositionQml(QWidget):
             plc_client=self.plc_client,
             mode_data=self.mode_data,
             parent=self)
-        if dlg.exec() == QDialog.Accepted:
-            new_seqs = dlg.get_sequence_data()
-            new_points = dlg.get_position_points()
+        def finished(accepted, editor):
+            if not accepted:
+                return
+            new_seqs = editor.get_sequence_data()
+            new_points = editor.get_position_points()
             self.sequences.clear()
             self.sequences.update(new_seqs)
             if isinstance(self.raw_sequence_ref, list):
@@ -739,6 +709,7 @@ class PagePositionQml(QWidget):
             self.position_points.update(new_points)
             self._refresh_ui()
             self.sig_sequence_changed.emit()
+        dlg.open(finished)
 
     # ---- 호환 (main_window 가 _refresh_ui() 호출) ----
     def showEvent(self, event):
@@ -750,11 +721,11 @@ class PagePositionQml(QWidget):
         QTimer.singleShot(0, self._check_axis_visibility)
 
     def _check_axis_visibility(self):
-        if not self.plc_client or not self.plc_client.is_connected:
-            return
         try:
-            data = self.plc_client.read_words(0x09, self.plc_client.AXIS_PARAM_ADDR, 1)
-            if data:
-                self._axis.set_vis(data[0])
+            from utils.json_utils import load_json
+            from utils.paths import get_settings_path
+            uses = (load_json(get_settings_path()) or {}).get("axis_uses", [True] * 8)
+            mask = sum((1 << i) for i, enabled in enumerate(uses[:8]) if enabled)
+            self._axis.set_vis(mask)
         except Exception as e:
             print(f"[Position] 축 표시 갱신 실패: {e}")

@@ -1,38 +1,28 @@
-import copy
 import json
 import os
 import sys
-import threading
 from datetime import datetime
 from utils.paths import get_settings_path, get_recipes_dir
 from utils.json_utils import load_json, save_json
-from engine.qt_runtime import LocalDIORuntime
-from PySide6.QtCore import QTimer
-from PySide6.QtWidgets import (
-    QWidget, QFrame, QVBoxLayout, QHBoxLayout, 
-    QStackedWidget, QSizePolicy
-)
+from engine.qt_runtime import LocalDIORuntime, PLCSequenceRuntime
+from PySide6.QtCore import QTimer, QPropertyAnimation, QEasingCurve
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QStackedWidget
 
-from widgets.nav_button import NavButton
-from ui.top_bar import TopBar
+from ui.qml_chrome import QmlTopBar, QmlBottomBar
+from ui.qml_overlay import QmlOverlayLayer
 
 # 페이지들 임포트
 from ui.pages.page_mode_qml import PageModeQml
 from ui.pages.page_position_qml import PagePositionQml
 from ui.pages.page_timer_qml import PageTimerQml
-from ui.pages.page_packing import PagePacking
+from ui.pages.page_packing_qml import PagePackingQml
 from ui.pages.page_data_qml import PageDataQml
-from ui.dialogs.sequence_editor_dialog import MONITOR_SEQ_KEY, normalize_all_sequences
 from ui.pages.page_manual_qml import PageManualQml
 from ui.pages.page_auto_qml import PageAutoQml
 from ui.pages.page_settings_qml import PageSettingsQml
 
-# [조그 오버레이 임포트]
-from ui.dialogs.jog_control_dialog import JogControlDialog
-
 # ★ [추가] 알람 오버레이 임포트
-from ui.overlays.alarm_overlay import AlarmOverlay, STEP_ALARM_DESCRIPTIONS, USER_ALARMS
-from ui.overlays.alarm_history_overlay import AlarmHistoryOverlay
+from ui.overlays.alarm_overlay import STEP_ALARM_DESCRIPTIONS, USER_ALARMS
 from utils.alarm_history import record as record_alarm
 from utils.op_history import record as record_op
 
@@ -95,7 +85,7 @@ class MainWindow(QWidget):
         root.setSpacing(12)
 
         # ===== 1. Top Bar =====
-        self.top_bar = TopBar()
+        self.top_bar = QmlTopBar()
         root.addWidget(self.top_bar)
 
         # PLC 통신 상태를 TopBar와 연결
@@ -205,10 +195,24 @@ class MainWindow(QWidget):
                 self.master_sequence_data,
                 _control_settings.get("ezi_io_ip", "192.168.0.5"),
                 self,
+                position_points=self.master_position_points,
             )
             self.local_runtime.sig_connected.connect(self.top_bar.set_comm_status)
             self.local_runtime.sig_monitor_data.connect(self.top_bar._on_monitor_data)
             self.local_runtime.sig_error.connect(lambda msg: print(f"[Local DIO] {msg}"))
+        elif self.control_backend == "plc":
+            self.local_runtime = PLCSequenceRuntime(
+                self.master_sequence_data, self.plc_client, self,
+                position_points=self.master_position_points,
+                mode_provider=lambda index: (
+                    0 <= index < len(self.master_mode_data)
+                    and bool(self.master_mode_data[index])
+                ),
+                packing_config=self.master_packing_config,
+            )
+            self.local_runtime.sig_connected.connect(self.top_bar.set_comm_status)
+            self.local_runtime.sig_monitor_data.connect(self.top_bar._on_monitor_data)
+            self.local_runtime.sig_error.connect(lambda msg: print(f"[Pendant Executor] {msg}"))
 
         self.stack = QStackedWidget()
         self.stack.setMinimumHeight(0)
@@ -253,7 +257,7 @@ class MainWindow(QWidget):
             packing_config=self.master_packing_config
         )
 
-        self.pages["packing"] = PagePacking(
+        self.pages["packing"] = PagePackingQml(
             position_points=self.master_position_points,
             sequence_data=self.master_sequence_data,
             plc_client=self.plc_client,
@@ -274,41 +278,18 @@ class MainWindow(QWidget):
         if loaded_name != "No Data":
             self.pages["data"].set_current_filename(loaded_name)
 
-        # ===== 4. Bottom Bar =====
-        bottom = QFrame()
-        bottom.setObjectName("BottomBar")
-        bottom.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        bottom.setMinimumHeight(70)
-        
-        b_lay = QHBoxLayout(bottom)
-        b_lay.setContentsMargins(14, 4, 14, 4)
-        b_lay.setSpacing(10)
-
-        self.nav_buttons = {}
-
-        def add_nav(page_key: str, text_key: str, index: int):
-            initial_text = text_key
-            if LanguageManager:
-                initial_text = LanguageManager.instance().get_text(text_key)
-                
-            btn = NavButton(initial_text)
-            btn.clicked.connect(lambda: self.goto_page(page_key, index))
-            btn.setProperty("text_key", text_key)
-            
-            self.nav_buttons[page_key] = btn
-            b_lay.addWidget(btn)
-
-        add_nav("manual",   "nav_manual", 0)
-        add_nav("auto",     "nav_auto",   1)
-        add_nav("mode",     "nav_mode",   2)
-        add_nav("position", "nav_pos",    3)
-        add_nav("timer",    "nav_timer",  4)
-        add_nav("packing",  "nav_packing",5)
-        add_nav("data",     "nav_data",   6)
-        add_nav("settings", "nav_setting",7)
-
-        root.addWidget(bottom)
+        # ===== 4. QML Bottom Bar =====
+        self._nav_text_keys = ["nav_manual", "nav_auto", "nav_mode", "nav_pos",
+                               "nav_timer", "nav_packing", "nav_data", "nav_setting"]
+        labels = [LanguageManager.instance().get_text(k) for k in self._nav_text_keys] if LanguageManager else list(self._nav_text_keys)
+        self.bottom_bar = QmlBottomBar(self.page_keys, labels, self)
+        self.bottom_bar.sig_selected.connect(self.goto_page)
+        root.addWidget(self.bottom_bar)
         self.goto_page("manual", 0)
+
+        # Shared QML overlay. Popups stay in the Qt Quick scene and never enter
+        # a nested QWidget event loop.
+        self.qml_overlay = QmlOverlayLayer(self)
 
         # =========================================================
         # ★ [추가] 5. Alarm Overlay (항상 최상단)
@@ -320,12 +301,15 @@ class MainWindow(QWidget):
         self._prev_op_status = 0
         self._user_alarm_no = 0
         self._step_alarm_id = 0
-        self.alarm_overlay = AlarmOverlay(self) # MainWindow(self)가 부모
-        self.alarm_overlay.resize(self.size()) # 초기 크기 맞춤
+        self.alarm_overlay = self.qml_overlay
+        self.alarm_overlay.resize(self.size())
 
         # 리셋 버튼 신호 연결 (모멘터리: 누를때 1, 뗄때 0)
         self.alarm_overlay.sig_reset_pressed.connect(self._on_alarm_reset_pressed)
         self.alarm_overlay.sig_reset_released.connect(self._on_alarm_reset_released)
+        if self.local_runtime and hasattr(self.local_runtime, "sig_timeout_request"):
+            self.local_runtime.sig_timeout_request.connect(self._on_pendant_timeout)
+            self.local_runtime.sig_nonblocking_alarm.connect(self._on_pendant_alarm_go)
         
         # PLC 데이터 감시 연결 (알람 체크용)
         if self.plc_client:
@@ -421,91 +405,33 @@ class MainWindow(QWidget):
         if not self.plc_client or not self.plc_client.is_connected:
             return
         # 즉시 전송: 수 Words 단위라 빠름
-        self.plc_client.send_mode_settings(self.master_mode_data)
-        self.plc_client.send_speed_override(self.master_speed_state.get("speed_level", 10))
-        self.plc_client.send_packing_config(self.master_packing_config)
+        self.plc_client.submit(self.plc_client.send_mode_settings, list(self.master_mode_data))
+        self.plc_client.submit(
+            self.plc_client.send_speed_override,
+            self.master_speed_state.get("speed_level", 10),
+        )
+        self.plc_client.submit(
+            self.plc_client.send_packing_config, dict(self.master_packing_config)
+        )
         print(f"[Sync] PLC 연결 후 모드/전체속도/패킹설정 전송 완료")
 
-        # 무거운 항목: 백그라운드에서 전송 (수초 소요)
-        threading.Thread(target=self._send_full_recipe_to_plc, daemon=True).start()
+        # 시퀀스와 분기 데이터는 팬던트에서 실행한다. PLC에는 전체 레시피를
+        # 전송하지 않으며 물리 명령 메일박스만 사용한다.
 
     def _send_packing_config_to_plc(self):
         """패킹 설정 변경 시 PLC 로 전송 (sig_packing_changed 슬롯)"""
         if not self.plc_client or not self.plc_client.is_connected:
             return
-        self.plc_client.send_packing_config(self.master_packing_config)
-
-    def _send_full_recipe_to_plc(self):
-        """포인트 테이블 + 시퀀스 40슬롯 전체를 PLC 로 송신 (백그라운드 스레드 호출).
-        sequence_editor_dialog._send_all_sequences_to_plc 와 동일한 인코딩 규칙."""
-        if self.control_backend == "ezi_io":
-            return
-        if not self.plc_client or not self.plc_client.is_connected:
-            return
-        try:
-            points = self.master_position_points
-            sequences = self.master_sequence_data
-
-            # ★ 옛/누락 필드 보정 (편집기에서 미클릭 스텝도 정확히 송신되도록)
-            timer_lib = getattr(self, "master_timer_library", None)
-            normalize_all_sequences(sequences, timer_lib)
-
-            sorted_p_names = sorted(points.keys())
-            point_map = {name: i for i, name in enumerate(sorted_p_names)}
-
-            seq_map = {"Main": 0, MONITOR_SEQ_KEY: 39}
-            reserved = set(seq_map.keys())
-            sub = sorted([k for k in sequences.keys() if k not in reserved])
-            for i, k in enumerate(sub):
-                seq_map[k] = i + 1
-
-            ok_seq = True
-            for seq_name, slot_id in seq_map.items():
-                raw_steps = sequences.get(seq_name, [])
-                if not isinstance(raw_steps, list):
-                    continue
-
-                # COMMENT 제외 인덱스 재매핑 (JMP target 재계산용)
-                plc_idx_map = {}
-                plc_idx = 0
-                for orig_idx, step in enumerate(raw_steps):
-                    if step.get("type") != "COMMENT":
-                        plc_idx_map[orig_idx] = plc_idx
-                        plc_idx += 1
-
-                plc_steps = []
-                for orig_idx, step in enumerate(raw_steps):
-                    if step.get("type") == "COMMENT":
-                        continue
-                    s_data = copy.deepcopy(step)
-                    if s_data.get("type") == "POS":
-                        s_data["point_index"] = point_map.get(s_data.get("point_name"), 0)
-                    elif s_data.get("type") == "CALL":
-                        s_data["sequence_id"] = seq_map.get(s_data.get("target_seq"), 0)
-                    elif s_data.get("type") == "JMP":
-                        s_data["target_step"] = plc_idx_map.get(s_data.get("target_idx", 0), 0)
-                    plc_steps.append(s_data)
-
-                if not self.plc_client.send_sequence_to_slot(slot_id, plc_steps):
-                    ok_seq = False
-
-            ok_pts = self.plc_client.send_all_points(points, sorted_p_names)
-
-            if ok_seq and ok_pts:
-                print("[Sync] 포인트·시퀀스 전체 재전송 완료")
-            else:
-                print(f"[Sync] ⚠ 일부 전송 실패 (seq_ok={ok_seq}, pts_ok={ok_pts})")
-        except Exception as e:
-            print(f"[Sync] 전체 레시피 전송 중 예외: {e}")
+        self.plc_client.submit(
+            self.plc_client.send_packing_config, dict(self.master_packing_config)
+        )
 
     # 조그 오버레이 실행 함수
     def _open_jog_overlay(self):
         if self.top_bar.op_status in (1, 2):
             return  # 자동운전 / 확인운전 중에는 JOG 차단
-        page_manual = self.pages.get("manual")
-        self._jog_dialog = JogControlDialog(plc_client=self.plc_client, page_manual=page_manual, parent=self)
-        self._jog_dialog.exec()
-        self._jog_dialog = None
+        self._jog_dialog = self.qml_overlay
+        self.qml_overlay.show_jog()
 
     def goto_page(self, key: str, index: int):
         if key == "settings":
@@ -513,33 +439,53 @@ class MainWindow(QWidget):
                 return
             self._request_settings_password(index)
             return
+        self._switch_page(index)
+
+    def _switch_page(self, index):
+        if not 0 <= index < self.stack.count():
+            return
         self.stack.setCurrentIndex(index)
-        for k, btn in self.nav_buttons.items():
-            btn.set_active(k == key)
+        self.bottom_bar.set_current(index)
+        page = self.stack.widget(index)
+        view = getattr(page, "_view", None)
+        root = view.rootObject() if view is not None else None
+        if root is None:
+            return
+        if getattr(self, "_page_animation", None) is not None:
+            self._page_animation.stop()
+        previous_root = getattr(self, "_animated_page_root", None)
+        if previous_root is not None:
+            previous_root.setProperty("opacity", 1.0)
+        root.setProperty("opacity", 0.0)
+        animation = QPropertyAnimation(root, b"opacity", self)
+        animation.setDuration(140)
+        animation.setStartValue(0.0)
+        animation.setEndValue(1.0)
+        animation.setEasingCurve(QEasingCurve.OutCubic)
+        self._page_animation = animation
+        self._animated_page_root = root
+        animation.finished.connect(lambda r=root: r.setProperty("opacity", 1.0))
+        animation.start()
 
     def _request_settings_password(self, index: int):
-        try:
-            from ui.dialogs.sequence_utils import NumericKeypad, DarkMessageDialog
-            dlg = NumericKeypad("설정 비밀번호를 입력하세요", decimals=0, parent=self, password_mode=True)
-            if dlg.exec() == 1:
-                val = int(dlg.get_value())
-                if val == 2026:
-                    self.stack.setCurrentIndex(index)
-                    for k, btn in self.nav_buttons.items():
-                        btn.set_active(k == "settings")
-                else:
-                    err_dlg = DarkMessageDialog("비밀번호 오류", "비밀번호가 올바르지 않습니다.", is_error=True, parent=self)
-                    err_dlg.exec()
-        except Exception as e:
-            print(f"[Settings] Password dialog error: {e}")
+        def finished(accepted, value):
+            if not accepted:
+                return
+            if int(value) == 2026:
+                self._switch_page(index)
+            else:
+                self.qml_overlay.show_message(
+                    "비밀번호 오류", "비밀번호가 올바르지 않습니다.", error=True,
+                )
+        self.qml_overlay.request_number(
+            "설정 비밀번호를 입력하세요", 0, minimum=0, maximum=999999,
+            password=True, callback=finished,
+        )
 
     def update_language(self, lang_code):
         if not LanguageManager: return
         lm = LanguageManager.instance()
-        for key, btn in self.nav_buttons.items():
-            text_key = btn.property("text_key")
-            if text_key:
-                btn.setText(lm.get_text(text_key))
+        self.bottom_bar.set_labels([lm.get_text(k) for k in self._nav_text_keys])
                 
         for page in self.pages.values():
             if hasattr(page, "update_language"):
@@ -565,11 +511,13 @@ class MainWindow(QWidget):
             self.pages["packing"].refresh_ui()
 
         if self.plc_client and self.plc_client.is_connected:
-            self.plc_client.send_mode_settings(self.master_mode_data)
-            self.plc_client.send_packing_config(self.master_packing_config)
-            # 레시피 교체 시에도 포인트·시퀀스 전체 재전송 (백그라운드)
-            threading.Thread(target=self._send_full_recipe_to_plc, daemon=True).start()
-            print(f"[Mode] 레시피 '{filename}' 모드/패킹설정 전송 + 전체 재전송 시작")
+            self.plc_client.submit(
+                self.plc_client.send_mode_settings, list(self.master_mode_data)
+            )
+            self.plc_client.submit(
+                self.plc_client.send_packing_config, dict(self.master_packing_config)
+            )
+            print(f"[Mode] 레시피 '{filename}' 모드/패킹설정 전송")
         
         try:
             data = load_json(self.settings_file) or {}
@@ -582,7 +530,7 @@ class MainWindow(QWidget):
         if "timer" in self.pages:
             self.pages["timer"].refresh_grid()
         if "packing" in self.pages:
-            self.pages["packing"]._refresh_base_points_label()
+            self.pages["packing"].refresh_ui()
         self._save_point_visibility_to_settings()
         self._auto_save_data()
 
@@ -626,6 +574,8 @@ class MainWindow(QWidget):
     def resizeEvent(self, event):
         if hasattr(self, 'alarm_overlay'):
             self.alarm_overlay.resize(self.size())
+        if hasattr(self, 'qml_overlay'):
+            self.qml_overlay.resize(self.size())
         super().resizeEvent(event)
 
     def _show_alarm_overlay(self):
@@ -637,18 +587,24 @@ class MainWindow(QWidget):
             self.alarm_overlay.show()
             self.alarm_overlay.raise_()
         else:
-            AlarmHistoryOverlay(parent=self).exec()
+            self.qml_overlay.show_history()
 
     def _on_alarm_reset_pressed(self):
         self._alarm_resetting = True
-        self.plc_client.write_words(0x09, self.plc_client.ADDR_ALARM_RESET, [1])
+        self.plc_client.submit(
+            self.plc_client.write_words, 0x09, self.plc_client.ADDR_ALARM_RESET, [1]
+        )
         record_op("ALARM_RESET", "알람 리셋 버튼")
 
     def _on_alarm_reset_released(self):
-        self.plc_client.write_words(0x09, self.plc_client.ADDR_ALARM_RESET, [0])
+        self.plc_client.submit(
+            self.plc_client.write_words, 0x09, self.plc_client.ADDR_ALARM_RESET, [0]
+        )
         # 사용자 알람(DT159) 클리어 및 즉시 숨김
         if getattr(self, '_user_alarm_showing', False):
-            self.plc_client.write_words(0x09, self.plc_client.ADDR_USER_ALARM, [0])
+            self.plc_client.submit(
+                self.plc_client.write_words, 0x09, self.plc_client.ADDR_USER_ALARM, [0]
+            )
             self._user_alarm_showing = False
             self._user_alarm_no = 0
             self.alarm_overlay.hide_user_alarm()
@@ -656,6 +612,26 @@ class MainWindow(QWidget):
 
     def _clear_alarm_reset_flag(self):
         self._alarm_resetting = False
+
+    def _on_pendant_timeout(self, request):
+        step = request.step
+        alarm_no = int(step.get("timeout_alarm_no", 0))
+        name = step.get("name", f"입력 {step.get('port', 0)}")
+        message = f"'{name}' 입력 대기시간이 초과되었습니다."
+        if alarm_no:
+            message += f"\n알람 A-{alarm_no:03d}"
+        self.qml_overlay.request_confirm(
+            "입력 타임아웃", message,
+            accept_text="다음 진행", reject_text="정지",
+            callback=request.resolve,
+        )
+
+    def _on_pendant_alarm_go(self, alarm_no, name):
+        message = f"'{name}' 입력 타임아웃 후 다음 스텝을 진행합니다."
+        if alarm_no:
+            message += f"\n알람 A-{alarm_no:03d}"
+        record_alarm("USER", int(alarm_no), message)
+        self.qml_overlay.show_message("입력 타임아웃", message, error=True)
 
     # ★ [추가] 알람 상태 감시 함수
     def _check_alarm_status(self, data):
@@ -711,7 +687,9 @@ class MainWindow(QWidget):
             self._user_alarm_showing = True
             self._user_alarm_no = alarm_no
             # 즉시 DT159 클리어 (핸드셰이크) → 재트리거 방지
-            self.plc_client.write_words(0x09, self.plc_client.ADDR_USER_ALARM, [0])
+            self.plc_client.submit(
+                self.plc_client.write_words, 0x09, self.plc_client.ADDR_USER_ALARM, [0]
+            )
             self.alarm_overlay.show_user_alarm(alarm_no)
             # [NEW] 이력 기록
             msg = USER_ALARMS.get(alarm_no, f"사용자 알람 #{alarm_no}")

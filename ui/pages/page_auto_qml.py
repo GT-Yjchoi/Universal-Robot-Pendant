@@ -1,7 +1,7 @@
 """
 자동운전 페이지 QML(GPU) — PageAuto drop-in.
 UI/스크롤만 QML. 로직(속도·운전모드·확인창·monitor)은 PageAuto 와 동일.
-확인 오버레이는 기존 Python AutoConfirmOverlay 재사용 (동작 보존).
+확인/메시지 입력은 애플리케이션 공통 QML 오버레이를 사용한다.
 """
 import os
 
@@ -11,7 +11,6 @@ from PySide6.QtWidgets import QVBoxLayout, QWidget
 from PySide6.QtQuickWidgets import QQuickWidget
 
 from ui.pages.page_manual_qml import AxisModel, IoModel, IoBackend
-from ui.pages.page_auto import AutoConfirmOverlay   # 확인창 로직 재사용
 
 try:
     from utils.languages import LanguageManager
@@ -168,12 +167,6 @@ class PageAutoQml(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(self._view)
 
-        # 원점복귀 상태(DT165)는 모니터 범위(DT100~163) 밖이라 별도 폴링.
-        # 안전 핵심 모니터 파이프라인(MONITOR_COUNT/파서)은 건드리지 않음.
-        self._home_timer = QTimer(self)
-        self._home_timer.setInterval(500)
-        self._home_timer.timeout.connect(self._poll_home_status)
-
         if self.plc_client:
             self.plc_client.sig_monitor_data.connect(self._on_monitor_data)
             self.plc_client.sig_connected.connect(self._refresh_axis_visibility)
@@ -202,7 +195,7 @@ class PageAutoQml(QWidget):
         self.speed_state["speed_level"] = new_val
         self._be.changed.emit()
         if self.plc_client:
-            self.plc_client.send_speed_override(self.speed_level)
+            self.plc_client.submit(self.plc_client.send_speed_override, self.speed_level)
         self.sig_speed_changed.emit(self.speed_level)
         try:
             from utils.op_history import record as op_record
@@ -216,14 +209,14 @@ class PageAutoQml(QWidget):
         self.speed_state["speed_level"] = new_val
         self._be.changed.emit()
         if self.plc_client:
-            self.plc_client.send_speed_override(self.speed_level)
+            self.plc_client.submit(self.plc_client.send_speed_override, self.speed_level)
 
     def _send_mode(self, mode):
         if self.local_runtime:
             self.local_runtime.start_mode(mode)
             return
         if self.plc_client:
-            self.plc_client.send_control_command(mode)
+            self.plc_client.submit(self.plc_client.send_control_command, mode)
 
     def _on_stop_clicked(self):
         self._send_mode(0)
@@ -242,59 +235,61 @@ class PageAutoQml(QWidget):
                 self.local_runtime.pause()
             return
         if self.plc_client:
-            self.plc_client.send_check_run_command(state)
+            self.plc_client.submit(self.plc_client.send_check_run_command, state)
 
     def _show_home_required(self):
-        AutoConfirmOverlay("원점복귀 필요", "원점복귀를 먼저 완료해주세요.",
-                           self.window(), btn_yes="확인", btn_no=None).exec()
+        self.window().qml_overlay.show_message("원점복귀 필요", "원점복귀를 먼저 완료해주세요.")
 
     def _can_start_run(self):
         if self.current_mode in (1, 2):
             return False
-        if self.local_runtime:
-            return self.local_runtime.is_connected
         if not self._home_done:
             self._show_home_required()
             return False
-        return True
+        if self.local_runtime:
+            return self.local_runtime.is_connected
+        return bool(self.plc_client and self.plc_client.is_connected)
 
     def _on_auto_clicked(self):
         if not self._can_start_run():
             return
-        if AutoConfirmOverlay("자동 운전", "자동 운전을 시작하시겠습니까?",
-                              self.window()).exec():
+        def accepted(ok):
+            if not ok: return
             self._send_mode(1)
             try:
                 from utils.op_history import record as op_record
                 op_record("RUN", "자동 운전 시작")
             except Exception:
                 pass
+        self.window().qml_overlay.request_confirm("자동 운전", "자동 운전을 시작하시겠습니까?", callback=accepted)
 
     def _on_check_clicked(self):
         if not self._can_start_run():
             return
-        if AutoConfirmOverlay("확인 운전", "확인 운전을 시작하시겠습니까?",
-                              self.window()).exec():
+        def accepted(ok):
+            if not ok: return
             self._send_mode(2)
             try:
                 from utils.op_history import record as op_record
                 op_record("RUN", "확인 운전 시작")
             except Exception:
                 pass
+        self.window().qml_overlay.request_confirm("확인 운전", "확인 운전을 시작하시겠습니까?", callback=accepted)
 
     def _on_home_clicked(self):
         # 원점복귀: 확인 후 DT164 에 1 기록(영역 0x09, write_words).
         # 자동운전/확인운전 중에는 차단(자동·확인 버튼과 동일 가드).
-        if self.local_runtime:
-            return
         if self.current_mode in (1, 2):
             return
         if not self.plc_client or not self.plc_client.is_connected:
             return
-        if AutoConfirmOverlay("원점복귀", "원점복귀를 하시겠습니까?",
-                              self.window()).exec():
+        def accepted(ok):
+            if not ok: return
             try:
-                self.plc_client.write_words(0x09, 164, [1])
+                if self.local_runtime and hasattr(self.local_runtime, "home"):
+                    self.local_runtime.home()
+                else:
+                    self.plc_client.submit(self.plc_client.write_words, 0x09, 164, [1])
             except Exception as e:
                 print(f"[Auto] 원점복귀 명령(DT164) 실패: {e}")
                 return
@@ -305,21 +300,12 @@ class PageAutoQml(QWidget):
                 op_record("RUN", "원점복귀 명령(DT164=1)")
             except Exception:
                 pass
-
-    def _poll_home_status(self):
-        # DT165==1 → 원점복귀완료. (모니터 범위 밖이라 별도 read_words 폴링)
-        if not self.plc_client or not self.plc_client.is_connected:
-            return
-        try:
-            vals = self.plc_client.read_words(0x09, 165, 1)
-        except Exception:
-            return
-        done = bool(vals and vals[0] == 1)
-        if done != self._home_done:
-            self._home_done = done
-            self._be.changed.emit()
+        self.window().qml_overlay.request_confirm("원점복귀", "원점복귀를 하시겠습니까?", callback=accepted)
 
     def _on_monitor_data(self, data):
+        home_done = bool(data.get('home_done', self._home_done))
+        if home_done != self._home_done:
+            self._home_done = home_done
         mode = data.get('op_status', 0)
         if self._prev_op_status == 2 and mode == 0:
             self._send_check_state(0)
@@ -342,23 +328,20 @@ class PageAutoQml(QWidget):
         self._be.changed.emit()
 
     def _refresh_axis_visibility(self):
-        if not self.plc_client or not self.plc_client.is_connected:
-            return
         try:
-            d = self.plc_client.read_words(0x09, self.plc_client.AXIS_PARAM_ADDR, 1)
-            if d:
-                self._axis.set_visibility(d[0])
+            from utils.paths import get_settings_path
+            from utils.json_utils import load_json
+            uses = (load_json(get_settings_path()) or {}).get("axis_uses", [True] * 8)
+            mask = sum((1 << i) for i, enabled in enumerate(uses[:8]) if enabled)
+            self._axis.set_visibility(mask)
         except Exception as e:
             print(f"Axis Config Load Error: {e}")
 
     def showEvent(self, event):
         super().showEvent(event)
         QTimer.singleShot(0, self._refresh_axis_visibility)
-        QTimer.singleShot(0, self._poll_home_status)
-        self._home_timer.start()
 
     def hideEvent(self, event):
-        self._home_timer.stop()
         super().hideEvent(event)
 
     def update_language(self, lang_code=None):

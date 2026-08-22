@@ -1,7 +1,7 @@
 # Universal Robot Pendant — 산업용 서보 제어 HMI
 
 Raspberry Pi 5와 Raspberry Pi OS Lite 64-bit 기반 PySide6 풀스크린 HMI 앱.
-파나소닉 PLC(FPWIN Pro)와 TCP(MEWTOCOL-style) 통신으로 8축 서보 시스템을 제어하고 시퀀스·포인트를 관리합니다.
+파나소닉 FP0H와 TCP(MEWTOCOL-style)로 통신하며, QML 화면과 레시피 실행은 팬던트가 담당하고 PLC는 서보·물리 I/O·안전 인터록을 담당합니다.
 
 ---
 
@@ -40,16 +40,26 @@ Wi-Fi 기본 경로와 분리한다. 프로토콜의 16/32비트 필드는 littl
 I8O8의 논리 출력 0~7은 통합 프로토콜 비트맵의 bit 8~15에 대응하므로 클라이언트를
 `output_offset=8, output_count=8`로 생성한다.
 
-### 로컬 DIO 시퀀스 실행
+### 팬던트 시퀀스 실행
 
-`settings.json`의 `control_backend`를 `ezi_io`로 설정하면 PLC 자동접속과 PLC 레시피
-전송 대신 Raspberry Pi의 `SequenceExecutor`가 레시피를 직접 실행한다. 지원 스텝은
-`OUT`, `IN`, `TMR`, `JMP(INPUT 조건)`, `CALL`, `END`, `COMMENT`이다. `POS`, `DAT`처럼
-서보/PLC 메모리가 필요한 스텝은 로컬 DIO 모드에서 오류 정지하며 모든 출력을 OFF한다.
-`plc`로 되돌리면 기존 PLC 통신과 실행 경로를 그대로 사용한다.
+기본값인 `control_backend=plc`에서도 레시피 제어 흐름은 Raspberry Pi의
+`SequenceExecutor`가 실행한다. `POS`, `OUT`, `IN`, `TMR`, `JMP`, `CALL`, `DAT`,
+`END`, `COMMENT`를 지원하며 별도 `Monitor` 시퀀스도 팬던트에서 실행한다. PLC에는
+전체 레시피를 내려보내지 않고 `DT300..DT354` 명령 메일박스로 서보 이동과 물리 출력
+명령만 전달한다. 계약과 ST 초안은 `plc/FP0H_PENDANT_MAILBOX.md`를 참고한다.
 
-시퀀스 편집기는 `SequenceEditor.qml`과 `sequence_editor_qml.py`로 구성된 QML 편집기를
-기본 사용한다. 기존 QWidget 편집기와 PLC 인코더는 호환 및 복귀용으로 삭제하지 않았다.
+`control_backend=ezi_io`는 서보가 없는 Ezi-IO 시험용 경로다. QML 시퀀스 편집기는
+기존 레시피의 시스템/밸브/내부 I/O, 입력 타임아웃, 조건 JMP, 병렬 CALL, DAT 및
+POS 활성축을 보존한다. 이전 QWidget 구현은 소스 호환·참고용으로만 남아 있으며
+현재 실행 화면과 팝업에는 사용하지 않는다.
+
+### QML 화면과 통신 스레드
+
+상단바, 하단 내비게이션, 8개 페이지, 알람/JOG/키패드/키보드/확인/선택/이력 팝업은
+Qt Quick/QML로 렌더링한다. PLC 모니터 데이터는 변경된 모델 행만 `dataChanged`로
+갱신하고 숨겨진 페이지는 최신 패킷만 보관한다. 사용자 명령은 PLC 클라이언트의 단일
+FIFO 백엔드 큐에서 실행하므로 화면 스레드가 TCP 응답을 기다리지 않으며 모멘터리
+ON/OFF 순서가 보장된다.
 
 ---
 

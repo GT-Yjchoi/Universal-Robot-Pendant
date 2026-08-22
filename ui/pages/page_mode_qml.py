@@ -24,15 +24,6 @@ try:
     from utils.mode_manager import ModeManager
 except ImportError:
     ModeManager = None
-try:
-    from widgets.touch_keyboard import TouchKeyboard
-except ImportError:
-    TouchKeyboard = None
-try:
-    from ui.dialogs.sequence_utils import DarkMessageDialog
-except ImportError:
-    DarkMessageDialog = None
-
 TOTAL_SLOTS = 44
 _QML_PATH = os.path.join(os.path.dirname(__file__), "PageMode.qml")
 
@@ -155,11 +146,13 @@ class PageModeQml(QWidget):
                 if on_count == 0:
                     self.mode_data[idx] = True
                     self._model.refresh_row(idx)
-                    if DarkMessageDialog:
-                        DarkMessageDialog(
+                    overlay = getattr(self.window(), "qml_overlay", None)
+                    if overlay:
+                        overlay.show_message(
                             "설정 불가",
                             "이 그룹은 필수 항목입니다.\n최소 하나는 반드시 켜져 있어야 합니다.",
-                            is_error=True, parent=self).exec()
+                            error=True,
+                        )
                     return
             is_exclusive = (self.interlock_exclusive[grp]
                             if grp < len(self.interlock_exclusive) else False)
@@ -175,24 +168,21 @@ class PageModeQml(QWidget):
 
         self._model.refresh_row(idx)
         if self.plc_client and self.plc_client.is_connected:
-            self.plc_client.send_mode_settings(self.mode_data)
+            self.plc_client.submit(self.plc_client.send_mode_settings, list(self.mode_data))
 
     def _rename_mode(self, idx):
-        if not ModeManager or not TouchKeyboard:
+        if not ModeManager:
             return
         current = ModeManager.instance().get_name(idx)
-        dlg = TouchKeyboard("모드 이름 변경", parent=self)
-        for setter in ("set_language", "set_layout"):
-            if hasattr(dlg, setter):
-                getattr(dlg, setter)("EN")
-                break
-        if hasattr(dlg, "set_text"):
-            dlg.set_text(current)
-        elif hasattr(dlg, "input_field"):
-            dlg.input_field.setText(current)
-        from PySide6.QtWidgets import QDialog
-        if dlg.exec() == QDialog.Accepted:
-            ModeManager.instance().set_name(idx, dlg.get_text())
+        overlay = getattr(self.window(), "qml_overlay", None)
+        if overlay:
+            overlay.request_text(
+                "모드 이름 변경", current,
+                callback=lambda accepted, value: (
+                    ModeManager.instance().set_name(idx, value.strip())
+                    if accepted and value.strip() else None
+                ),
+            )
 
     # ---- 인터록 (PageMode 와 동일) ----------------------------------
     def _load_interlock_groups(self):

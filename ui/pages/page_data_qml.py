@@ -10,17 +10,11 @@ from datetime import datetime
 from PySide6.QtCore import (Qt, QObject, Signal, Slot, Property, QUrl,
                             QAbstractListModel, QModelIndex, QByteArray)
 from PySide6.QtGui import QColor
-from PySide6.QtWidgets import QVBoxLayout, QWidget, QDialog
+from PySide6.QtWidgets import QVBoxLayout, QWidget
 from PySide6.QtQuickWidgets import QQuickWidget
 
 from utils.paths import get_recipes_dir
 from utils.json_utils import save_json
-from ui.pages.page_data import GlassConfirmDialog   # 다이얼로그 재사용
-
-try:
-    from widgets.touch_keyboard import TouchKeyboard
-except ImportError:
-    TouchKeyboard = None
 try:
     from utils.mode_manager import ModeManager
 except ImportError:
@@ -289,20 +283,12 @@ class PageDataQml(QWidget):
                 self.sig_file_loaded.emit(display_name)
                 t_done = lm.get_text("title_done") if lm else "완료"
                 m_done = lm.get_text("msg_save_done") if lm else "저장되었습니다."
-                msg = GlassConfirmDialog(
-                    t_done, m_done,
-                    btn_yes=lm.get_text("btn_confirm") if lm else "확인",
-                    parent=self)
-                msg.btn_no.hide()
-                msg.exec()
+                self.window().qml_overlay.show_message(t_done, m_done)
             else:
                 print(f"[AutoSave] Saved {display_name}.json")
         except Exception as e:
             if not is_auto:
-                err = GlassConfirmDialog("Error", f"Save Failed:\n{e}",
-                                         btn_yes="OK", parent=self)
-                err.btn_no.hide()
-                err.exec()
+                self.window().qml_overlay.show_message("Error", f"Save Failed:\n{e}", error=True)
             else:
                 print(f"[AutoSave] Error: {e}")
 
@@ -313,56 +299,45 @@ class PageDataQml(QWidget):
         lm = LanguageManager.instance() if LanguageManager else None
         t_title = lm.get_text("title_new") if lm else "새로 만들기"
         t_msg = lm.get_text("msg_new_confirm") if lm else "데이터를 새로 만듭니다."
-        if GlassConfirmDialog(t_title, t_msg, parent=self).exec() != QDialog.Accepted:
-            return
-        if not TouchKeyboard:
-            return
-        dlg = TouchKeyboard("새 파일 이름 입력", parent=self)
-        if hasattr(dlg, "set_language"):
-            dlg.set_language("EN")
-        elif hasattr(dlg, "set_layout"):
-            dlg.set_layout("EN")
-        if dlg.exec() != QDialog.Accepted:
-            return
-        name = dlg.get_text()
-        if not name:
-            return
-        safe_name = "".join(c for c in name if c.isalnum()
-                            or c in (' ', '_', '-', '.')).strip()
-        if not safe_name:
-            return
-        filepath = os.path.join(self.save_dir, f"{safe_name}.json")
-        if os.path.exists(filepath):
-            t_dup = lm.get_text("title_dup") if lm else "중복 확인"
-            msg_dup = (lm.get_text("msg_dup_confirm").format(safe_name) if lm
-                       else f"'{safe_name}' 중복. 덮어쓸까요?")
-            if GlassConfirmDialog(t_dup, msg_dup,
-                                  parent=self).exec() != QDialog.Accepted:
-                return
-        if "Main" not in self.sequence_data or not self.sequence_data["Main"]:
-            self.sequence_data["Main"] = [{
-                "type": "POS", "name": "원점 복귀", "point_name": "원점",
-                "active_axes": [True] * 8, "speeds": [100] * 8}]
-        self._perform_save(filepath, safe_name)
+        def confirmed(ok):
+            if not ok: return
+            self.window().qml_overlay.request_text("새 파일 이름 입력", callback=named)
+        def named(ok, name):
+            if not ok or not name: return
+            safe_name = "".join(c for c in name if c.isalnum() or c in (' ', '_', '-', '.')).strip()
+            if not safe_name: return
+            filepath = os.path.join(self.save_dir, f"{safe_name}.json")
+            if os.path.exists(filepath):
+                title = lm.get_text("title_dup") if lm else "중복 확인"
+                body = (lm.get_text("msg_dup_confirm").format(safe_name) if lm else f"'{safe_name}' 중복. 덮어쓸까요?")
+                self.window().qml_overlay.request_confirm(
+                    title, body, callback=lambda accepted: finalize(filepath, safe_name) if accepted else None,
+                )
+            else:
+                finalize(filepath, safe_name)
+        def finalize(filepath, safe_name):
+            if "Main" not in self.sequence_data or not self.sequence_data["Main"]:
+                self.sequence_data["Main"] = [{
+                    "type": "POS", "name": "원점 복귀", "point_name": "원점",
+                    "active_axes": [True] * 8, "speeds": [100] * 8}]
+            self._perform_save(filepath, safe_name)
+        self.window().qml_overlay.request_confirm(t_title, t_msg, callback=confirmed)
 
     def _on_save_clicked(self):
         lm = LanguageManager.instance() if LanguageManager else None
         if not self.current_filename or self.current_filename == "No Data":
             t_not = lm.get_text("title_notice") if lm else "알림"
             m_not = lm.get_text("msg_no_save_target") if lm else "저장할 대상이 없습니다."
-            msg = GlassConfirmDialog(
-                t_not, m_not,
-                btn_yes=lm.get_text("btn_confirm") if lm else "확인", parent=self)
-            msg.btn_no.hide()
-            msg.exec()
+            self.window().qml_overlay.show_message(t_not, m_not)
             return
         t_sav = lm.get_text("title_save") if lm else "저장 확인"
         m_sav = (lm.get_text("msg_save_confirm").format(self.current_filename)
                  if lm else f"[{self.current_filename}] 에 저장?")
-        if GlassConfirmDialog(t_sav, m_sav,
-                              parent=self).exec() == QDialog.Accepted:
+        def finished(accepted):
+            if not accepted: return
             filepath = os.path.join(self.save_dir, f"{self.current_filename}.json")
             self._perform_save(filepath, self.current_filename)
+        self.window().qml_overlay.request_confirm(t_sav, m_sav, callback=finished)
 
     def _on_load_clicked(self):
         cur = self._cur_item()
@@ -370,20 +345,19 @@ class PageDataQml(QWidget):
         if not cur:
             t_not = lm.get_text("title_notice") if lm else "알림"
             m_not = lm.get_text("msg_no_sel_load") if lm else "파일을 선택해주세요."
-            msg = GlassConfirmDialog(
-                t_not, m_not,
-                btn_yes=lm.get_text("btn_confirm") if lm else "확인", parent=self)
-            msg.btn_no.hide()
-            msg.exec()
+            self.window().qml_overlay.show_message(t_not, m_not)
             return
         filename, disp = cur
         filepath = os.path.join(self.save_dir, filename)
         t_load = lm.get_text("title_load") if lm else "불러오기 확인"
         m_load = (lm.get_text("msg_load_confirm").format(disp) if lm
                   else f"'{disp}' 로드?")
-        if GlassConfirmDialog(t_load, m_load,
-                              parent=self).exec() != QDialog.Accepted:
-            return
+        self.window().qml_overlay.request_confirm(
+            t_load, m_load,
+            callback=lambda accepted: self._perform_load(filepath, disp, lm) if accepted else None,
+        )
+
+    def _perform_load(self, filepath, disp, lm):
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
                 new_data = json.load(f)
@@ -425,16 +399,9 @@ class PageDataQml(QWidget):
                     ModeManager.instance().load_from_dict(user_modes)
             t_done = lm.get_text("title_done") if lm else "완료"
             m_done = lm.get_text("msg_load_done") if lm else "로드 완료."
-            msg = GlassConfirmDialog(
-                t_done, m_done,
-                btn_yes=lm.get_text("btn_confirm") if lm else "확인", parent=self)
-            msg.btn_no.hide()
-            msg.exec()
+            self.window().qml_overlay.show_message(t_done, m_done)
         except Exception as e:
-            err = GlassConfirmDialog("Error", f"Load Failed:\n{e}",
-                                     btn_yes="OK", parent=self)
-            err.btn_no.hide()
-            err.exec()
+            self.window().qml_overlay.show_message("Error", f"Load Failed:\n{e}", error=True)
 
     def _on_del_clicked(self):
         cur = self._cur_item()
@@ -442,19 +409,15 @@ class PageDataQml(QWidget):
         if not cur:
             t_not = lm.get_text("title_notice") if lm else "알림"
             m_not = lm.get_text("msg_no_sel_del") if lm else "선택해주세요."
-            msg = GlassConfirmDialog(
-                t_not, m_not,
-                btn_yes=lm.get_text("btn_confirm") if lm else "확인", parent=self)
-            msg.btn_no.hide()
-            msg.exec()
+            self.window().qml_overlay.show_message(t_not, m_not)
             return
         filename, deleted_name = cur
         filepath = os.path.join(self.save_dir, filename)
         t_del = lm.get_text("title_del") if lm else "삭제 확인"
         m_del = (lm.get_text("msg_del_confirm").format(deleted_name) if lm
                  else f"'{deleted_name}' 삭제?")
-        if GlassConfirmDialog(t_del, m_del,
-                              parent=self).exec() == QDialog.Accepted:
+        def finished(accepted):
+            if not accepted: return
             try:
                 os.remove(filepath)
                 self._refresh_file_list()
@@ -463,7 +426,5 @@ class PageDataQml(QWidget):
                     self.current_filename = None
                 self._be.changed.emit()
             except Exception as e:
-                err = GlassConfirmDialog("Error", f"Delete Failed:\n{e}",
-                                         btn_yes="OK", parent=self)
-                err.btn_no.hide()
-                err.exec()
+                self.window().qml_overlay.show_message("Error", f"Delete Failed:\n{e}", error=True)
+        self.window().qml_overlay.request_confirm(t_del, m_del, callback=finished)

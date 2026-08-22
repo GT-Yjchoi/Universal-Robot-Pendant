@@ -1,8 +1,8 @@
 {
-    "control_backend": "ezi_io",
+    "control_backend": "plc",
     "ezi_io_ip": "192.168.0.5",
     "last_recipe": "20pcs",
-    "plc_ip": "192.168.1.10",
+    "plc_ip": "192.168.0.20",
     "plc_port": "60001",
     "axis_uses": [
         true,

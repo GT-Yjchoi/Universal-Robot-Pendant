@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Protocol
 
 from drivers.fastech_ezi_io import EziIOClient
+from .control_backend import SignalGroup
 
 
 class DigitalIOBackend(Protocol):
@@ -61,3 +62,22 @@ class FastechI8O8Backend:
 
     def close(self) -> None:
         self.client.close()
+
+    def read_input(self, group: SignalGroup, index: int) -> bool:
+        if group != SignalGroup.SYSTEM_IO:
+            return False
+        return bool(self.read_inputs() & (1 << index))
+
+    def read_output(self, group: SignalGroup, index: int) -> bool:
+        if group != SignalGroup.SYSTEM_IO:
+            return False
+        return bool(self.read_outputs() & (1 << index))
+
+    def snapshot(self) -> tuple[int, int]:
+        return self.read_inputs(), self.read_outputs()
+
+    def move(self, step) -> None:
+        raise RuntimeError("Ezi-IO backend does not support servo positioning")
+
+    def stop_motion(self) -> None:
+        pass
