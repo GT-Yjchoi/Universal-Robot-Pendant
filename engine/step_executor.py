@@ -140,7 +140,10 @@ class SequenceExecutor:
             step_type = str(step.get("type", "")).upper()
             if step_type not in self.SUPPORTED_TYPES:
                 raise UnsupportedStepError(f"unsupported local DIO step: {step_type or '(empty)'}")
-            self._emit(name, index, step_type)
+            monitor_index = sum(
+                1 for prior in steps[:index] if str(prior.get("type", "")).upper() != "COMMENT"
+            )
+            self._emit(name, monitor_index, step_type)
 
             if step_type == "COMMENT":
                 index += 1

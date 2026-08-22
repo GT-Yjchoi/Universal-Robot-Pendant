@@ -87,9 +87,11 @@ class TimerBackend(QObject):
 class PageTimerQml(QWidget):
     sig_timer_changed = Signal()
 
-    def __init__(self, sequence_data=None, timer_library=None, plc_client=None):
+    def __init__(self, sequence_data=None, timer_library=None, plc_client=None,
+                 local_runtime=None):
         super().__init__()
         self.plc_client = plc_client
+        self.local_runtime = local_runtime
         self.sequence_data = sequence_data if sequence_data is not None else {}
         self.timer_library = timer_library if timer_library is not None else {}
 
@@ -124,6 +126,8 @@ class PageTimerQml(QWidget):
 
         if self.plc_client:
             self.plc_client.sig_monitor_data.connect(self._on_monitor_data)
+        if self.local_runtime:
+            self.local_runtime.sig_monitor_data.connect(self._on_monitor_data)
         QTimer.singleShot(0, self.refresh_grid)
 
     # ---- 호환 ----

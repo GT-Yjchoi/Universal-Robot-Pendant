@@ -210,9 +210,10 @@ class PagePositionQml(QWidget):
 
     def __init__(self, sequence_data=None, position_points=None,
                  view_order_data=None, mode_data=None, timer_library=None,
-                 plc_client=None):
+                 plc_client=None, local_runtime=None):
         super().__init__()
         self.plc_client = plc_client
+        self.local_runtime = local_runtime
         self.raw_sequence_ref = sequence_data if sequence_data is not None else []
         self.position_points = position_points if position_points is not None else {}
         self.view_order_data = view_order_data if view_order_data is not None else []
@@ -262,6 +263,8 @@ class PagePositionQml(QWidget):
 
         if self.plc_client:
             self.plc_client.sig_monitor_data.connect(self._update_realtime_values)
+        if self.local_runtime:
+            self.local_runtime.sig_monitor_data.connect(self._update_realtime_values)
         self._refresh_ui()
 
     # ---- PagePosition 와 동일 ----
@@ -473,8 +476,11 @@ class PagePositionQml(QWidget):
         self._be.changed.emit()
 
         if op_status in (1, 2):
-            current_slot = data.get('sub_seq_idx', 0) if isinstance(data, dict) else 0
-            target_name = self._get_seq_name_by_slot(current_slot)
+            if isinstance(data, dict) and data.get('local_dio'):
+                target_name = data.get('local_sequence') or "Main"
+            else:
+                current_slot = data.get('sub_seq_idx', 0) if isinstance(data, dict) else 0
+                target_name = self._get_seq_name_by_slot(current_slot)
             if target_name and target_name != self.current_seq_key \
                     and target_name in self.sequences:
                 self.current_seq_key = target_name

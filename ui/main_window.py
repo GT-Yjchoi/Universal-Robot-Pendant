@@ -207,6 +207,7 @@ class MainWindow(QWidget):
                 self,
             )
             self.local_runtime.sig_connected.connect(self.top_bar.set_comm_status)
+            self.local_runtime.sig_monitor_data.connect(self.top_bar._on_monitor_data)
             self.local_runtime.sig_error.connect(lambda msg: print(f"[Local DIO] {msg}"))
 
         self.stack = QStackedWidget()
@@ -231,13 +232,15 @@ class MainWindow(QWidget):
             position_points=self.master_position_points,
             mode_data=self.master_mode_data,
             timer_library=self.master_timer_library,
-            plc_client=self.plc_client
+            plc_client=self.plc_client,
+            local_runtime=self.local_runtime,
         )
 
         self.pages["timer"] = PageTimerQml(
             sequence_data=self.master_sequence_data,
             timer_library=self.master_timer_library,
-            plc_client=self.plc_client
+            plc_client=self.plc_client,
+            local_runtime=self.local_runtime,
         )
 
         self.pages["data"] = PageDataQml(
