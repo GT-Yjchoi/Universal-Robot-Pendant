@@ -16,7 +16,7 @@ from PySide6.QtQuickWidgets import QQuickWidget
 
 from ui.pages.page_position import (NumberInputOverlay, FineAdjustOverlay,
                                     PointNameCardOverlay, PositionOrderDialog)
-from ui.dialogs.sequence_editor_dialog import SequenceEditorDialog
+from ui.dialogs.sequence_editor_qml import SequenceEditorQmlDialog
 from ui.pages.page_manual_qml import ValveModel, ValveBackend
 
 _QML_PATH = os.path.join(os.path.dirname(__file__), "PagePosition.qml")
@@ -713,7 +713,7 @@ class PagePositionQml(QWidget):
             self.sig_sequence_changed.emit()
 
     def _open_sequence_editor(self):
-        dlg = SequenceEditorDialog(
+        dlg = SequenceEditorQmlDialog(
             sequence_data=self.sequences,
             position_points=self.position_points,
             timer_library=self.timer_library,

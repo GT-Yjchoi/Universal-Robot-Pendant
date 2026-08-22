@@ -6,6 +6,7 @@ import threading
 from datetime import datetime
 from utils.paths import get_settings_path, get_recipes_dir
 from utils.json_utils import load_json, save_json
+from engine.qt_runtime import LocalDIORuntime
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
     QWidget, QFrame, QVBoxLayout, QHBoxLayout, 
@@ -83,6 +84,9 @@ class MainWindow(QWidget):
             self.plc_client = PLCClient() 
 
         self.settings_file = get_settings_path()
+        _control_settings = load_json(self.settings_file) or {}
+        self.control_backend = _control_settings.get("control_backend", "plc")
+        self.local_runtime = None
         self.recipes_dir = get_recipes_dir()
 
         # 메인 레이아웃
@@ -196,6 +200,15 @@ class MainWindow(QWidget):
         self.top_bar.set_mold_data(loaded_name)
 
         # ===== 3. Pages =====
+        if self.control_backend == "ezi_io":
+            self.local_runtime = LocalDIORuntime(
+                self.master_sequence_data,
+                _control_settings.get("ezi_io_ip", "192.168.0.5"),
+                self,
+            )
+            self.local_runtime.sig_connected.connect(self.top_bar.set_comm_status)
+            self.local_runtime.sig_error.connect(lambda msg: print(f"[Local DIO] {msg}"))
+
         self.stack = QStackedWidget()
         self.stack.setMinimumHeight(0)
         root.addWidget(self.stack, 1)
@@ -204,7 +217,11 @@ class MainWindow(QWidget):
         self.page_keys = ["manual", "auto", "mode", "position", "timer", "packing", "data", "settings"]
 
         self.pages["manual"] = PageManualQml(plc_client=self.plc_client)
-        self.pages["auto"] = PageAutoQml(plc_client=self.plc_client, speed_state=self.master_speed_state)
+        self.pages["auto"] = PageAutoQml(
+            plc_client=self.plc_client,
+            speed_state=self.master_speed_state,
+            local_runtime=self.local_runtime,
+        )
         
         self.pages["mode"] = PageModeQml(mode_data=self.master_mode_data, plc_client=self.plc_client)
         
@@ -346,12 +363,16 @@ class MainWindow(QWidget):
 
     def closeEvent(self, event):
         """앱 종료 시 GPIO 정리"""
+        if self.local_runtime:
+            self.local_runtime.close()
         if self._gpio_estop:
             self._gpio_estop.stop()
         super().closeEvent(event)
 
     def _try_auto_connect(self):
         """설정 파일에서 IP/Port를 읽어와 자동 연결 시도"""
+        if self.control_backend == "ezi_io":
+            return
         if self.plc_client.is_connected:
             return
 
@@ -414,6 +435,8 @@ class MainWindow(QWidget):
     def _send_full_recipe_to_plc(self):
         """포인트 테이블 + 시퀀스 40슬롯 전체를 PLC 로 송신 (백그라운드 스레드 호출).
         sequence_editor_dialog._send_all_sequences_to_plc 와 동일한 인코딩 규칙."""
+        if self.control_backend == "ezi_io":
+            return
         if not self.plc_client or not self.plc_client.is_connected:
             return
         try:

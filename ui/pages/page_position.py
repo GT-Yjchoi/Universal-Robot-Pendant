@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (
 
 from widgets.glass_card import GlassCard
 from ui.widgets.valve_tile import ValvePanel
-from ui.dialogs.sequence_editor_dialog import SequenceEditorDialog
+from ui.dialogs.sequence_editor_qml import SequenceEditorQmlDialog
 from ui.widgets.custom_inputs import TouchComboBox
 from utils.languages import LanguageManager
 
@@ -553,7 +553,7 @@ class PagePosition(GlassCard):
             self._update_preview_list()
 
     def _open_sequence_editor(self):
-        dlg = SequenceEditorDialog(
+        dlg = SequenceEditorQmlDialog(
             sequence_data=self.sequences,
             position_points=self.position_points,
             timer_library=self.timer_library,

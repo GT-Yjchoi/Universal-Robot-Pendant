@@ -133,9 +133,10 @@ class AutoBackend(QObject):
 class PageAutoQml(QWidget):
     sig_speed_changed = Signal(int)
 
-    def __init__(self, plc_client=None, speed_state=None):
+    def __init__(self, plc_client=None, speed_state=None, local_runtime=None):
         super().__init__()
         self.plc_client = plc_client
+        self.local_runtime = local_runtime
         self.current_mode = 0
         self._prev_op_status = 0
         self._check_run_state = 0
@@ -176,6 +177,8 @@ class PageAutoQml(QWidget):
         if self.plc_client:
             self.plc_client.sig_monitor_data.connect(self._on_monitor_data)
             self.plc_client.sig_connected.connect(self._refresh_axis_visibility)
+        if self.local_runtime:
+            self.local_runtime.sig_monitor_data.connect(self._on_monitor_data)
         if IOManager:
             IOManager.instance().sig_names_changed.connect(self._apply_io_names)
         if LanguageManager:
@@ -216,6 +219,9 @@ class PageAutoQml(QWidget):
             self.plc_client.send_speed_override(self.speed_level)
 
     def _send_mode(self, mode):
+        if self.local_runtime:
+            self.local_runtime.start_mode(mode)
+            return
         if self.plc_client:
             self.plc_client.send_control_command(mode)
 
@@ -229,6 +235,12 @@ class PageAutoQml(QWidget):
             pass
 
     def _send_check_state(self, state):
+        if self.local_runtime:
+            if state:
+                self.local_runtime.resume()
+            else:
+                self.local_runtime.pause()
+            return
         if self.plc_client:
             self.plc_client.send_check_run_command(state)
 
@@ -239,6 +251,8 @@ class PageAutoQml(QWidget):
     def _can_start_run(self):
         if self.current_mode in (1, 2):
             return False
+        if self.local_runtime:
+            return self.local_runtime.is_connected
         if not self._home_done:
             self._show_home_required()
             return False
@@ -271,6 +285,8 @@ class PageAutoQml(QWidget):
     def _on_home_clicked(self):
         # 원점복귀: 확인 후 DT164 에 1 기록(영역 0x09, write_words).
         # 자동운전/확인운전 중에는 차단(자동·확인 버튼과 동일 가드).
+        if self.local_runtime:
+            return
         if self.current_mode in (1, 2):
             return
         if not self.plc_client or not self.plc_client.is_connected:

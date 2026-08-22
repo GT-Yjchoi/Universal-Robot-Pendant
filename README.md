@@ -40,6 +40,17 @@ Wi-Fi 기본 경로와 분리한다. 프로토콜의 16/32비트 필드는 littl
 I8O8의 논리 출력 0~7은 통합 프로토콜 비트맵의 bit 8~15에 대응하므로 클라이언트를
 `output_offset=8, output_count=8`로 생성한다.
 
+### 로컬 DIO 시퀀스 실행
+
+`settings.json`의 `control_backend`를 `ezi_io`로 설정하면 PLC 자동접속과 PLC 레시피
+전송 대신 Raspberry Pi의 `SequenceExecutor`가 레시피를 직접 실행한다. 지원 스텝은
+`OUT`, `IN`, `TMR`, `JMP(INPUT 조건)`, `CALL`, `END`, `COMMENT`이다. `POS`, `DAT`처럼
+서보/PLC 메모리가 필요한 스텝은 로컬 DIO 모드에서 오류 정지하며 모든 출력을 OFF한다.
+`plc`로 되돌리면 기존 PLC 통신과 실행 경로를 그대로 사용한다.
+
+시퀀스 편집기는 `SequenceEditor.qml`과 `sequence_editor_qml.py`로 구성된 QML 편집기를
+기본 사용한다. 기존 QWidget 편집기와 PLC 인코더는 호환 및 복귀용으로 삭제하지 않았다.
+
 ---
 
 ## 프로젝트 구조
