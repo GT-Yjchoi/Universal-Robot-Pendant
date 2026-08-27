@@ -3,6 +3,8 @@ import struct
 import threading
 import time
 import queue
+import itertools
+import os
 from PySide6.QtCore import QObject, Signal, Slot
 
 class PLCClient(QObject):
@@ -28,9 +30,12 @@ class PLCClient(QObject):
         self._manual_disconnect = False
         self._last_monitor_data = {}
         self._recipe_transfer_active = False
-        self._command_queue = queue.Queue()
+        self._command_queue = queue.PriorityQueue()
+        self._command_sequence = itertools.count()
+        self._next_monitor_at = 0.0
+        self._last_monitor_at = 0.0
         self._command_thread = threading.Thread(
-            target=self._command_loop, name="plc-ui-command-queue", daemon=True
+            target=self._command_loop, name="plc-communication-core", daemon=True
         )
         self.sig_async_done.connect(self._deliver_async_result)
         self._command_thread.start()
@@ -43,22 +48,18 @@ class PLCClient(QObject):
 
         # 1. 실시간 모니터링 블록 (PLC → HMI): DT100~
         self.MONITOR_ADDR  = 100
-        self.MONITOR_COUNT = 66
-        self.ADDR_USER_ALARM = 159   # DT159: 사용자 알람 (IN 스텝에서 발동, w_UserAlarm)
-
-        # 2. 제어 명령 블록 (HMI → PLC): DT200~
-        self.ADDR_CTRL_CMD    = 200  # 운전 제어 명령
-        self.ADDR_JOG_PRESS   = 201  # 조작압 선택
-        self.ADDR_CHECK_RUN   = 202  # 확인운전 제어
-        self.ADDR_VALVE_OUT   = 204  # 밸브 수동출력 (204~205, 2 Words)
-        self.ADDR_JOG_CTRL    = 205  # 조그 제어
-        self.ADDR_MODE        = 206  # 모드 설정 (206~208, 3 Words)
-        self.ADDR_JOG_SPEED   = 211  # 조그 속도
-        self.ADDR_ALARM_RESET = 212  # 알람 리셋
-        self.ADDR_SOFT_ESTOP  = 213  # 소프트 비상정지 (0=정상, 1=비상정지)
-        self.HEARTBEAT_ADDR   = 214  # 하트비트
-        self.ADDR_JOG_MODE    = 215  # 수동조작 모드 선택 (0=앱솔루트기동, 1=JOG기동)
-        self.ADDR_SPEED_OVR   = 216  # 전체 속도 배율 (1~10 단계)
+        self.MONITOR_COUNT = 68  # DT100~167
+        # 2. 팬던트 → PLC 상태/수동 명령 블록 (확정 DT 맵)
+        self.HEARTBEAT_ADDR       = 200  # 통신 하트비트
+        self.ADDR_OPERATION_STATE = 201  # 현재 운전상태 (팬던트가 기록)
+        self.ADDR_OUTPUT_BASE     = 210  # DT210~213: 설정된 출력 그룹 1~4 요청
+        self.ADDR_JOG_CTRL        = 220  # 축 JOG 명령 비트
+        self.ADDR_JOG_SPEED       = 221  # JOG 속도
+        self.ADDR_SPEED_OVR       = 222  # 전체 속도 배율
+        self.ADDR_AXIS_STOP       = 223  # 축 정지 요청
+        self._operation_state = 0
+        self._axis_jog_bits = 0
+        self._axis_jog_lock = threading.Lock()
         self.heartbeat_value  = 0
         self._heartbeat_skip  = False
         self._last_heartbeat_at = 0.0
@@ -74,36 +75,85 @@ class PLCClient(QObject):
         self.POINT_SIZE      = 32
         self.MAX_POINTS      = 60
 
-        # 파렛타이징
-        self.ADDR_PACK_IDX = 161     # DT161~163 (pack_idx 공유, HMI·PLC 모두 R/W)
-        self.ADDR_PACK_CFG = 217     # DT217~230 (패킹 설정 HMI→PLC)
-
         # 5. 축 설정 블록: DT15000~ (50 Words)
         self.AXIS_PARAM_ADDR   = 15000
         self.ADDR_AXIS_DATASET = self.AXIS_PARAM_ADDR + 33  # 데이터셋 트리거
 
-    def submit(self, func, *args, callback=None):
+    def submit(self, func, *args, callback=None, priority=10):
         """Run a PLC operation in the single ordered backend queue.
 
         The optional callback is delivered on the Qt/UI thread as
         ``callback(result, error)``.  UI code never needs to wait for TCP.
         """
-        self._command_queue.put((func, args, callback))
+        self._command_queue.put(
+            (int(priority), next(self._command_sequence), func, args, callback)
+        )
 
     def _command_loop(self):
+        self._pin_communication_thread()
         while True:
-            func, args, callback = self._command_queue.get()
-            result = None
-            error = None
+            now = time.monotonic()
+            timeout = 0.05
+            if self._monitor_running and self.is_connected:
+                timeout = max(0.0, min(0.02, self._next_monitor_at - now))
             try:
-                result = func(*args)
-            except Exception as exc:
-                error = exc
-            if callback is not None:
-                self.sig_async_done.emit(callback, result, error)
-            elif error is not None:
-                print(f"[PLC async command] {error}")
-            self._command_queue.task_done()
+                _, _, func, args, callback = self._command_queue.get(
+                    timeout=timeout
+                )
+            except queue.Empty:
+                func = None
+            if func is not None:
+                result = None
+                error = None
+                try:
+                    result = func(*args)
+                except Exception as exc:
+                    error = exc
+                if callback is not None:
+                    self.sig_async_done.emit(callback, result, error)
+                elif error is not None:
+                    print(f"[PLC async command] {error}")
+                self._command_queue.task_done()
+
+            now = time.monotonic()
+            monitor_due = (
+                self._monitor_running and self.is_connected
+                and now >= self._next_monitor_at
+            )
+            monitor_forced = now - self._last_monitor_at >= 0.06
+            if monitor_due and (self._command_queue.empty() or monitor_forced):
+                self._poll_monitor_once()
+                now = time.monotonic()
+                self._last_monitor_at = now
+                self._next_monitor_at = now + 0.02
+
+    @staticmethod
+    def _pin_communication_thread():
+        """Best-effort Linux CPU affinity for the PLC worker only.
+
+        ``auto`` selects the last available CPU when at least two CPUs exist.
+        Set ``PENDANT_PLC_CPU=off`` to disable or provide an explicit CPU index.
+        No real-time scheduler policy is requested, so a communication fault
+        cannot starve the QML render or operating-system threads.
+        """
+        if not hasattr(os, "sched_getaffinity"):
+            return
+        value = os.environ.get("PENDANT_PLC_CPU", "auto").strip().lower()
+        if value in {"", "off", "false", "none", "-1"}:
+            return
+        try:
+            available = sorted(os.sched_getaffinity(0))
+            if len(available) < 2:
+                return
+            cpu = available[-1] if value == "auto" else int(value)
+            if cpu not in available:
+                raise ValueError(
+                    f"CPU {cpu} is not available; choices are {available}"
+                )
+            os.sched_setaffinity(0, {cpu})
+            print(f"[PLC] 통신 스레드 CPU{cpu} 고정")
+        except (OSError, ValueError) as exc:
+            print(f"[PLC] 통신 스레드 CPU 고정 생략: {exc}")
 
     @Slot(object, object, object)
     def _deliver_async_result(self, callback, result, error):
@@ -147,7 +197,7 @@ class PLCClient(QObject):
 
     def _update_heartbeat(self):
         """
-        하트비트 값을 +1 증가시키고 DT214에 전송
+        하트비트 값을 +1 증가시키고 DT200에 전송
         - 0~100 범위를 순환
         - 100 다음에는 0으로 리셋
         - 무한루프 방지: _heartbeat_skip 플래그 사용
@@ -157,7 +207,7 @@ class PLCClient(QObject):
         if self.heartbeat_value > 100:
             self.heartbeat_value = 0
         
-        # DT214에 하트비트 값 쓰기 (무한루프 방지)
+        # DT200에 하트비트 값 쓰기 (무한루프 방지)
         if not self._heartbeat_skip:
             self._heartbeat_skip = True  # 플래그 설정으로 재귀 방지
             try:
@@ -165,7 +215,7 @@ class PLCClient(QObject):
                 body = struct.pack('<BBBHH', 0x80, 0x50, 0x09, self.HEARTBEAT_ADDR, 1)
                 data_part = struct.pack('<H', self.heartbeat_value)
                 self._send_packet_raw(body + data_part)
-                # print(f"[하트비트] DT214 = {self.heartbeat_value}")  # 필요시 주석 해제
+                # print(f"[하트비트] DT200 = {self.heartbeat_value}")  # 필요시 주석 해제
             except OSError:
                 pass  # 하트비트 전송 실패는 무시
             finally:
@@ -322,123 +372,90 @@ class PLCClient(QObject):
         return result
 
     # =========================================================
-    # 제어 명령 (HMI → PLC) - DT200~208
+    # 팬던트 상태/수동 명령 (팬던트 → PLC)
     # =========================================================
     
+    def send_operation_state(self, state):
+        """DT201: 팬던트가 관리하는 현재 운전상태를 PLC에 알린다."""
+        state = max(0, min(3, int(state)))
+        self._operation_state = state
+        print(f"[PLC] 현재 운전상태 → DT{self.ADDR_OPERATION_STATE} = {state}")
+        return self.write_words(0x09, self.ADDR_OPERATION_STATE, [state])
+
     def send_control_command(self, mode):
-        """
-        DT200: 운전 제어 명령
-        - 0: 정지
-        - 1: 자동 (AUTO RUN)
-        - 2: 확인운전 (CHECK RUN)
-        """
-        if int(mode) in (1, 2) and self.is_recipe_transfer_active():
-            print("[PLC] X 레시피/시퀀스 전송 중이라 운전 시작 차단")
-            return False
-        print(f"[PLC] 운전 제어 명령 → DT{self.ADDR_CTRL_CMD} = {mode}")
-        return self.write_words(0x09, self.ADDR_CTRL_CMD, [mode])
+        """Compatibility alias: execution is local; only the state is reported."""
+        return self.send_operation_state(mode)
     
     def send_jog_command(self, jog_value):
-        """
-        DT201: 조작 압 선택
-        - 0: 제품압
-        - 1: 티칭압
-        """
-        print(f"[PLC] 조작 압 선택 → DT{self.ADDR_JOG_PRESS} = {jog_value}")
-        return self.write_words(0x09, self.ADDR_JOG_PRESS, [jog_value])
+        """Legacy pressure-selection command; no DT is assigned in the new map."""
+        print("[PLC] 조작압 선택은 팬던트 내부 설정으로 변경됨")
+        return True
     
     def send_check_run_command(self, state):
-        """
-        DT202: 확인운전 제어
-        - 확인운전 시작/중지 명령
-        """
-        if int(state) == 1 and self.is_recipe_transfer_active():
-            print("[PLC] X 레시피/시퀀스 전송 중이라 확인운전 진행 차단")
-            return False
-        print(f"[PLC] 확인운전 제어 → DT{self.ADDR_CHECK_RUN} = {state}")
-        return self.write_words(0x09, self.ADDR_CHECK_RUN, [state])
+        """Check-run stepping is owned by the pendant in the new map."""
+        return True
     
     def write_jog_bits(self, bit_mask):
-        """
-        DT204~205: 밸브 수동 제어 (Bit 단위)
-        - 32개 밸브를 Bit로 제어 (2 Words)
-        """
-        low = bit_mask & 0xFFFF
-        high = (bit_mask >> 16) & 0xFFFF
-        return self.write_words(0x09, self.ADDR_VALVE_OUT, [low, high])
+        """Write the four configured 16-bit output groups at DT210..DT213."""
+        words = [(int(bit_mask) >> (16 * i)) & 0xFFFF for i in range(4)]
+        return bool(self.write_words(0x09, self.ADDR_OUTPUT_BASE, words))
 
     def write_jog_bit(self, bit_pos, is_on):
-        """
-        DT204~205: 특정 밸브 On/Off
-        bit_pos: 0~31 (밸브 번호)
-        """
-        addr = self.ADDR_VALVE_OUT if bit_pos < 16 else self.ADDR_VALVE_OUT + 1
+        """Write one configured output in compact group order."""
+        bit_pos = max(0, min(63, int(bit_pos)))
+        addr = self.ADDR_OUTPUT_BASE + bit_pos // 16
         bit_index = bit_pos % 16
-        self.write_bit(0x09, addr, bit_index, is_on)
+        return self.write_bit(0x09, addr, bit_index, is_on)
     
     def send_jog_control(self, jog_bit):
-        """
-        DT205: 조그 제어 명령 (Bit 단위)
-        - 즉별 조그 이동 신호
-        """
-        return self.write_words(0x09, self.ADDR_JOG_CTRL, [jog_bit])
+        """DT220: 축별 JOG 방향 명령 비트."""
+        with self._axis_jog_lock:
+            self._axis_jog_bits = int(jog_bit) & 0xFFFF
+            value = self._axis_jog_bits
+        return self.write_words(0x09, self.ADDR_JOG_CTRL, [value])
+
+    def write_axis_jog_bit(self, bit_pos, is_on):
+        """Update pendant-owned DT220 locally and send it with one TCP write."""
+        bit_pos = int(bit_pos)
+        if not 0 <= bit_pos < 16:
+            raise ValueError(f"axis JOG bit out of range: {bit_pos}")
+        with self._axis_jog_lock:
+            if is_on:
+                # Never permit + and - for the same axis at the same time.
+                self._axis_jog_bits &= ~(1 << (bit_pos ^ 1))
+                self._axis_jog_bits |= 1 << bit_pos
+            else:
+                self._axis_jog_bits &= ~(1 << bit_pos)
+            value = self._axis_jog_bits
+        return self.write_words(0x09, self.ADDR_JOG_CTRL, [value])
+
+    def reset_axis_jog(self):
+        """Clear every DT220 JOG direction bit after startup/reconnect/close."""
+        return self.send_jog_control(0)
     
     def send_mode_settings(self, mode_data):
-        """
-        DT206~208: 모드 설정 변경 (3 Words = 40개 모드)
-        mode_data: 길이 40의 boolean 리스트
-        """
-        if len(mode_data) < 40:
-            mode_data = mode_data + [False] * (40 - len(mode_data))
-        
-        # 40개 모드를 3 Words로 압축
-        words = [0, 0, 0]
-        for i in range(40):
-            word_idx = i // 16
-            bit_idx = i % 16
-            if mode_data[i]:
-                words[word_idx] |= (1 << bit_idx)
-        
-        print(f"[PLC] 모드 설정 → DT{self.ADDR_MODE}~{self.ADDR_MODE+2} = {words}")
-        return self.write_words(0x09, self.ADDR_MODE, words)
+        """User modes are evaluated on the pendant; retained as a no-op API."""
+        return True
 
     def read_mode_settings(self):
-        """
-        DT206~208에서 현재 모드 설정 읽기
-        반환: 길이 44의 boolean 리스트 (모드 0~43)
-        """
-        words = self.read_words(0x09, self.ADDR_MODE, 3)
-        if not words or len(words) < 3:
-            return None
-        result = []
-        for i in range(44):
-            word_idx = i // 16
-            bit_idx = i % 16
-            result.append(bool(words[word_idx] & (1 << bit_idx)))
-        return result
+        return None
+
+    def send_axis_stop(self, active):
+        """DT223: pendant-requested axis stop (not a safety-rated E-stop)."""
+        val = 1 if active else 0
+        print(f"[PLC] 축 정지 요청 → DT{self.ADDR_AXIS_STOP} = {val}")
+        return self.write_words(0x09, self.ADDR_AXIS_STOP, [val])
 
     def send_soft_estop(self, active):
-        """
-        DT213: 소프트 비상정지
-        - True  / 1 : 비상정지 발동
-        - False / 0 : 비상정지 해제
-        """
-        val = 1 if active else 0
-        print(f"[PLC] 소프트 비상정지 → DT{self.ADDR_SOFT_ESTOP} = {val}")
-        return self.write_words(0x09, self.ADDR_SOFT_ESTOP, [val])
+        return self.send_axis_stop(active)
 
     def send_jog_mode(self, mode):
-        """
-        DT215: 수동조작 모드 선택
-        - 0: 앱솔루트기동 (위치결정 수동조작)
-        - 1: JOG기동 (JOG 수동조작)
-        """
-        print(f"[PLC] 수동조작 모드 → DT{self.ADDR_JOG_MODE} = {mode} ({'JOG' if mode else 'ABS'})")
-        return self.write_words(0x09, self.ADDR_JOG_MODE, [mode])
+        """Manual motion selection is owned by the pendant."""
+        return True
 
     def send_speed_override(self, level):
         """
-        DT216: 전체 속도 배율 (1~10 단계)
+        DT222: 전체 속도 배율 (1~10 단계)
         - 자동/확인운전 시 전체 속도에 곱해지는 배율
         """
         level = max(1, min(10, int(level)))
@@ -447,82 +464,14 @@ class PLCClient(QObject):
 
     def send_packing_config(self, cfg):
         """
-        DT217~230 에 패킹 설정 전송 (HMI → PLC).
-
-        Commit pattern (중간 통신 끊김 시 부분 활성화 방지):
-          1) DT217 = 0  (먼저 비활성화 → PLC 가 부분 설정 상태에서 동작 안 함)
-          2) DT218~230 데이터 쓰기 (pitch/dir/count/order)
-          3) DT217 = 1  (최종 활성화)
-
-        cfg["enabled"] 가 False 면 DT217 = 0 으로 끝내고 나머지는 건드리지 않음.
-        pitch 는 float mm → int32 (0.001mm) 로 스케일.
+        Compatibility no-op. Packing configuration and indices are now owned
+        entirely by the pendant; DT217~230 are reserved.
         """
-        if not self.is_connected:
-            return False
-        cfg = cfg or {}
-        if "enabled" in cfg:
-            enable = 1 if cfg.get("enabled") else 0
-        else:
-            enable = 1 if cfg else 0
-
-        def _s16(v):
-            return int(v) & 0xFFFF
-
-        # ── 1) 먼저 비활성화 ─────────────────────────────────────────
-        # 이 시점부터 다음 commit 완료 전까지 PLC 는 pack 카운터를 증가시키지 않음.
-        self.write_words(0x09, self.ADDR_PACK_CFG, [0])
-
-        if not enable:
-            print(f"[PLC] 패킹 미사용 → DT{self.ADDR_PACK_CFG} = 0")
-            return True
-
-        # ── 2) 나머지 설정 먼저 쓰기 ──────────────────────────────────
-        # DT218~223: pitches (DINT, ×1000)
-        for i, key in enumerate(("x_pitch", "y_pitch", "z_pitch")):
-            pitch_int = int(round(float(cfg.get(key, 0.0)) * 1000))
-            self.write_dint(0x09, self.ADDR_PACK_CFG + 1 + i * 2, pitch_int)
-
-        # DT224~226: directions (Z 는 기본 -1 = 위로 쌓기)
-        self.write_words(0x09, self.ADDR_PACK_CFG + 7, [
-            _s16(cfg.get("x_dir", 1)),
-            _s16(cfg.get("y_dir", 1)),
-            _s16(cfg.get("z_dir", -1)),
-        ])
-
-        # DT227~229: counts
-        self.write_words(0x09, self.ADDR_PACK_CFG + 10, [
-            max(1, int(cfg.get("x_count", 1))),
-            max(1, int(cfg.get("y_count", 1))),
-            max(1, int(cfg.get("z_count", 1))),
-        ])
-
-        # DT230: stack_order (0~5)
-        order = int(cfg.get("stack_order", 0)) % 6
-        self.write_words(0x09, self.ADDR_PACK_CFG + 13, [order])
-
-        # ── 3) 마지막으로 활성화 (commit) ────────────────────────────
-        self.write_words(0x09, self.ADDR_PACK_CFG, [1])
-
-        print(f"[PLC] 패킹 설정 전송 완료 (order={order}, cfg={cfg})")
         return True
 
     def write_pack_idx(self, axis, value):
-        """
-        사용자 수동 변경용: 특정 축의 현재 스택 인덱스(DT161~163)를 덮어씀.
-        axis: 'x' | 'y' | 'z'
-        value: 0-based index (0 = 첫 번째 칸)
-        """
-        if not self.is_connected:
-            return False
-        offsets = {"x": 0, "y": 1, "z": 2}
-        off = offsets.get(str(axis).lower())
-        if off is None:
-            return False
-        addr = self.ADDR_PACK_IDX + off
-        v = max(0, int(value)) & 0xFFFF
-        self.write_words(0x09, addr, [v])
-        print(f"[PLC] pack_idx {axis.upper()} 수동설정 → DT{addr} = {v}")
-        return True
+        """Compatibility no-op; packing indices are stored by the pendant."""
+        return False
 
     # =========================================================
     # 모니터링 (PLC → HMI) - DT100~141
@@ -582,163 +531,99 @@ class PLCClient(QObject):
                 self._reconnect_running = False
 
     def start_monitoring(self):
-        """실시간 모니터링 시작"""
+        """Enable cyclic reads on the dedicated communication core."""
         if self._monitor_running:
             return
         self._monitor_running = True
-        print("[PLC] 모니터링 시작 (DT100~DT160, 0.05초 주기)")
-        t = threading.Thread(target=self._mon_loop, daemon=True)
-        self._monitor_thread = t
-        t.start()
+        self._next_monitor_at = 0.0
+        self._last_monitor_at = time.monotonic()
+        print("[PLC] 전용 통신 코어 시작 (명령 우선, 모니터 약 33Hz)")
 
-    def _mon_loop(self):
-        """모니터링 루프 (0.1초 주기)"""
-        while self._monitor_running and self.is_connected:
-            raw = self.read_words(0x09, self.MONITOR_ADDR, self.MONITOR_COUNT)
-
-            if raw and len(raw) >= 40:  # 최소 40개 이상
-                try:
-                    res = self._parse_monitor_data(raw)
-                    self._last_monitor_data = res
-                    self.sig_monitor_data.emit(res)
-                except Exception as e:
-                    print(f"[PLC] 모니터링 파싱 에러: {e}")
-
-            # Heartbeat is independent from normal request/response traffic.
-            # Updating it after every packet doubled the 10 ms FP0H Ethernet
-            # transaction cost and also made command latency unpredictable.
-            now = time.monotonic()
-            if now - self._last_heartbeat_at >= 0.5:
-                self._last_heartbeat_at = now
-                self._update_heartbeat()
-
-            time.sleep(0.02)  # response ~10ms + 20ms rest: about 33Hz UI source
-        self._monitor_running = False  # 루프 종료 시 플래그 리셋 (재연결 후 재시작 가능하도록)
+    def _poll_monitor_once(self):
+        raw = self.read_words(0x09, self.MONITOR_ADDR, self.MONITOR_COUNT)
+        if raw and len(raw) >= self.MONITOR_COUNT:
+            try:
+                result = self._parse_monitor_data(raw)
+                self._last_monitor_data = result
+                self.sig_monitor_data.emit(result)
+            except Exception as exc:
+                print(f"[PLC] 모니터링 파싱 에러: {exc}")
+        now = time.monotonic()
+        if now - self._last_heartbeat_at >= 0.5:
+            self._last_heartbeat_at = now
+            self._update_heartbeat()
 
     def _parse_monitor_data(self, raw):
         """
         모니터링 데이터 파싱
-        raw: DT100~DT162의 Word 배열 (63개)
+        raw: DT100~DT167의 Word 배열 (68개)
         """
         res = {}
+
+        def dint(offset, *, signed=False):
+            value = raw[offset] | (raw[offset + 1] << 16)
+            if signed and value >= 0x80000000:
+                value -= 0x100000000
+            return value
         
         # ===== 1. 8축 현재 위치 (DT100~115) =====
         # DINT * 8 = 16 Words
         res['axis_pos'] = []
         for i in range(0, 16, 2):
-            v = raw[i] | (raw[i+1] << 16)
-            if v >= 0x80000000:  # 음수 처리
-                v -= 0x100000000
+            v = dint(i, signed=True)
             # 0.001mm 단위 → mm 변환
             res['axis_pos'].append(v / 1000.0)
-        
-        # ===== 2. 입력(X) 상태 (DT116~119) =====
-        # WORD * 4 = X0~X3F (64점 모니터링)
-        res['inputs'] = raw[16:20]  # DT116, 117, 118, 119
-        
-        # ===== 3. 출력(Y) 상태 (DT120~123) =====
-        # WORD * 4 = Y0~Y3F (64점 모니터링)
-        res['outputs'] = raw[20:24]  # DT120, 121, 122, 123
 
-        # DT126~127: 병렬 워커2 실행 상태 (워커1은 DT134~135)
-        res['parallel2_slot'] = raw[26] if len(raw) > 26 else 0
-        res['parallel2_step'] = raw[27] if len(raw) > 27 else 0
-        
-        # ===== 4. 밸브 동작 상태 (DT124~125) =====
-        # WORD * 2 = 32개 밸브 On/Off
-        res['valve_status'] = raw[24:26]  # DT124, 125
-        
-        # ===== 6. 현재 운전 상태 (DT129) =====
-        # INT: 1=수동, 2=자동, 0=정지, 3=일정지(확인운전)
-        res['op_status'] = raw[29]  # DT129
-        
-        # ===== 7. 확인운전 상태 (DT130) =====
-        # INT: 현재 확인운전 진행 상태
-        res['check_run_status'] = raw[30] if len(raw) > 30 else 0  # DT130
-        
-        # ===== 8. 현재 시퀀스 단계 (DT131) =====
-        # INT: 현재 실행 중인 스텝 번호
-        res['current_step'] = raw[31] if len(raw) > 31 else 0  # DT131
-        
-        # ===== 9. 현재 실행 슬롯 + 콜 스택 깊이 (DT132~133) =====
-        # DT132: 현재 실행 중 슬롯 번호 (FB.i_CurrentSlot) - 스택 top이 가리키는 슬롯
-        #        Main=0, 서브시퀀스=1~N(이름 정렬)
-        # DT133: 동기 CALL 스택 깊이 (FB.i_StackDepth) - 0~3
-        #        0=Main만 실행, 1=Main→Sub, 2=Main→Sub→SubSub, 3=최대 중첩
-        # ※ 키명 sub_seq_idx/sub_step은 구버전 호환 유지. 실제 의미는 위 주석 기준.
-        res['sub_seq_idx']  = raw[32] if len(raw) > 32 else 0  # DT132 = 현재 슬롯
-        res['sub_step']     = raw[33] if len(raw) > 33 else 0  # DT133 = 스택 깊이
-
-        # ===== 10. 병렬 워커1 실행 상태 (DT134~135) =====
-        # DT134: FB_Sub.i_CurrentSlot (병렬 워커1이 실행 중인 슬롯, 0=idle)
-        # DT135: FB_Sub.i_CurrentStep (병렬 워커1이 실행 중인 스텝)
-        # 키명 monitor_slot/monitor_step은 구버전 호환 유지.
-        res['monitor_slot'] = raw[34] if len(raw) > 34 else 0  # DT134
-        res['monitor_step'] = raw[35] if len(raw) > 35 else 0  # DT135
-
-        # ===== 11. 자동운전 생산 정보 (DINT) =====
-        # DT136~137: 스택수량, DT138~139: 포장수량, DT140~141: 예약수량
-        if len(raw) > 37:
-            res['total_count'] = raw[36] | (raw[37] << 16)  # DT136-137
-            res['stack_count'] = res['total_count']
-        else:
-            res['total_count'] = 0
-            res['stack_count'] = 0
-
-        if len(raw) > 39:
-            v = raw[38] | (raw[39] << 16)
-            res['pack_count'] = v
-            res['mold_time'] = v / 10.0  # 0.1초 → 초 변환
-        else:
-            res['pack_count'] = 0
-            res['mold_time'] = 0.0
-
-        if len(raw) > 41:
-            v = raw[40] | (raw[41] << 16)
-            res['reserve_count'] = v
-            res['setting_count'] = v
-            res['takeout_time'] = v / 10.0  # 0.1초 → 초 변환
-        else:
-            res['reserve_count'] = 0
-            res['setting_count'] = 0
-            res['takeout_time'] = 0.0
-
-        # ===== 14. 축 알람 상태 (DT142) + 축별 에러코드 (DT143~DT158) =====
-        # DT142: 비트0=1축, 비트1=2축, ... 비트7=8축, 비트8=비상정지
-        # DT143~158: 축별 에러코드 (DINT, 2워드씩)
+        # ===== 2. 축 알람/비상정지 (DT116) =====
+        # bit0~7=1~8축 알람, bit8=비상정지
         res['axis_alarms'] = []
-        res['axis_error_codes'] = [0] * 8  # 8축 에러코드
-        if len(raw) > 42:
-            alarm_word = raw[42]
-            for i in range(8):
-                if alarm_word & (1 << i):
-                    res['axis_alarms'].append(i + 1)  # 축 번호 (1~8)
-            if alarm_word & (1 << 8):  # 비상정지 (9번째 비트)
-                res['axis_alarms'].append(9)
+        alarm_word = raw[16]
         for i in range(8):
-            idx = 43 + i * 2  # DT143=index43, DT145=index45, ...
-            if len(raw) > idx + 1:
-                res['axis_error_codes'][i] = raw[idx] | (raw[idx + 1] << 16)
+            if alarm_word & (1 << i):
+                res['axis_alarms'].append(i + 1)
+        if alarm_word & (1 << 8):
+            res['axis_alarms'].append(9)
 
-        # ===== 15. 사용자 알람 (DT159) =====
-        # new_plc_fb.st의 w_UserAlarm - IN 스텝 P3=1/2 에서 세팅
-        # 0=없음, N=알람번호, N+1000=알람+진행
-        res['user_alarm'] = raw[59] if len(raw) > 59 else 0
+        # ===== 3. 8축 원점완료 비트맵 (DT117) =====
+        res['axis_home_bits'] = raw[17] & 0x00FF
+        # 활성 축 판단 전에도 사용할 수 있는 보수적인 호환값이다.
+        res['home_done'] = res['axis_home_bits'] == 0x00FF
 
-        # ===== 16. 스텝 알람 ID (DT160) =====
-        # new_plc_fb.st의 i_StepAlarmID (VAR_IN_OUT, 공유 변수 → g_StepAlarmID)
-        # 0=없음, 21/50/93~99=스텝 진행 에러
-        res['step_alarm_id'] = raw[60] if len(raw) > 60 else 0
+        # DT118~119: 예약
 
-        # ===== 17. 패킹 스택 인덱스 (DT161~163) =====
-        # PLC FB가 사이클 완료 시 증가시키는 x/y/z 현재 적층 위치 (0-based)
-        res['pack_idx'] = [
-            raw[61] if len(raw) > 61 else 0,
-            raw[62] if len(raw) > 62 else 0,
-            raw[63] if len(raw) > 63 else 0,
-        ]
-        res['home_request'] = raw[64] if len(raw) > 64 else 0
-        res['home_done'] = bool(raw[65]) if len(raw) > 65 else False
+        # ===== 4. 8축 에러코드 (DT120~135, DINT×8) =====
+        res['axis_error_codes'] = [dint(20 + i * 2) for i in range(8)]
+
+        # DT136~139: 예약
+
+        # ===== 5. 실제 입출력 상태 =====
+        # 4 WORD = X/Y 00~3F, 한 워드가 16점인 비압축 매핑
+        res['inputs'] = raw[40:44]    # DT140~143
+        res['outputs'] = raw[44:48]   # DT144~147
+
+        # DT148~149: 예약
+
+        # ===== 6. PLC 운전모드 상태 (DT150) =====
+        # 팬던트가 DT201에 쓰는 현재 운전상태와 구분한다.
+        res['operation_mode_status'] = raw[50]
+
+        # DT151~159: 예약
+
+        # ===== 7. 생산 정보 (DT160~167, DINT×4) =====
+        production_count = dint(60)
+        target_count = dint(62)
+        takeout_cycle_raw = dint(64)
+        molding_cycle_raw = dint(66)
+
+        res['production_count'] = production_count
+        res['total_count'] = production_count
+        res['stack_count'] = production_count
+        res['target_count'] = target_count
+        res['setting_count'] = target_count
+        res['takeout_cycle_time'] = takeout_cycle_raw / 10.0
+        res['takeout_time'] = res['takeout_cycle_time']
+        res['molding_cycle_time'] = molding_cycle_raw / 10.0
+        res['mold_time'] = res['molding_cycle_time']
 
         return res
 
@@ -747,11 +632,8 @@ class PLCClient(QObject):
     # =========================================================
 
     def current_op_status(self):
-        """마지막 모니터링값 기준 운전 상태. 0=정지, 1=자동, 2=확인운전."""
-        try:
-            return int(self._last_monitor_data.get("op_status", 0))
-        except (TypeError, ValueError):
-            return 0
+        """Pendant-owned operation state mirrored to DT201."""
+        return int(self._operation_state)
 
     def is_sequence_running(self):
         return self.current_op_status() in (1, 2)
@@ -871,7 +753,7 @@ class PLCClient(QObject):
             on_value = step_data.get("on", step_data.get("on_off", False))
             opt = 1 if on_value else 0
             port = int(step_data.get("port", step_data.get("io_index", 0)))
-            # out_type: 0=시스템출력(DT203), 1=밸브출력(DT204), 2=내부비트(DT300~301)
+            # Legacy encoder only: current execution uses the DT300 mailbox.
             out_type = int(step_data.get("out_type", 0))
             p1 = port
             p2 = out_type

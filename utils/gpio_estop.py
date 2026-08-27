@@ -58,7 +58,7 @@ class GpioEstop(QObject):
 
     def start(self):
         if not _GPIO_AVAILABLE:
-            print("[GPIO E-Stop] GPIO 사용 불가 — 비상정지 비활성")
+            print("[GPIO E-Stop] GPIO 사용 불가 - 비상정지 비활성")
             return
         self._timer.start()
         print(f"[GPIO E-Stop] GPIO{ESTOP_PIN} 폴링 시작 ({POLL_MS}ms 주기)")
@@ -90,7 +90,7 @@ class GpioEstop(QObject):
         if self._pending_count >= DEBOUNCE_CNT and is_estop != self._active:
             self._active = is_estop
             self.sig_estop.emit(is_estop)
-            print(f"[GPIO E-Stop] {'🔴 비상정지 발동' if is_estop else '🟢 비상정지 해제'}")
+            print(f"[GPIO E-Stop] {'비상정지 발동' if is_estop else '비상정지 해제'}")
 
     @property
     def is_active(self):

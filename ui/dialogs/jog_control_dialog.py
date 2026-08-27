@@ -254,15 +254,15 @@ class JogControlDialog(QWidget):
 
     # ==========================================================
     # [NEW] 실시간 출력 상태 → 토글 밸브 버튼 동기화
-    # bit_index 0~15  → outputs[0] (DT120=Y00~Y0F) bit 0~15
-    # bit_index 16~31 → outputs[1] (DT121=Y20~Y2F) bit 0~15
+    # bit_index 0~15  → outputs[0] (DT144=Y00~Y0F) bit 0~15
+    # bit_index 16~31 → outputs[2] (DT146=Y20~Y2F) bit 0~15
     # 모멘터리 버튼은 건드리지 않음 (사용자가 누르는 중일 수 있음)
     # ==========================================================
     def _on_monitor_data(self, data):
         if not isinstance(data, dict) or not self.isVisible():
             return
         outputs = data.get('outputs', [])
-        if not outputs or len(outputs) < 2:
+        if not outputs or len(outputs) < 3:
             return
         for btn in self._valve_btns:
             if btn.property("valve_mode") != "toggle":
@@ -273,7 +273,7 @@ class JogControlDialog(QWidget):
             if bit_index < 16:
                 word_idx, bit_pos = 0, bit_index
             else:
-                word_idx, bit_pos = 1, bit_index - 16
+                word_idx, bit_pos = 2, bit_index - 16
             if word_idx >= len(outputs):
                 continue
             is_on = bool(outputs[word_idx] & (1 << bit_pos))

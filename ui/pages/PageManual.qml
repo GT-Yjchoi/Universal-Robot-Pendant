@@ -5,6 +5,12 @@ import QtQuick.Layouts
 
 Rectangle {
     id: root
+    required property var axisModel
+    required property var ioInModel
+    required property var ioOutModel
+    required property var valveModel
+    required property var ioBackend
+    required property var valveBackend
     color: "#660F161E"          // .GlassCard
     radius: 16
     border.color: "#23FFFFFF"

@@ -7,13 +7,9 @@
 """
 import os
 
-from PySide6.QtCore import (Qt, QObject, Signal, Slot, Property, QUrl, QTimer,
+from PySide6.QtCore import (Qt, QObject, Signal, Slot, Property, QTimer,
                             QAbstractListModel, QModelIndex, QByteArray)
-from PySide6.QtGui import QColor
-from PySide6.QtWidgets import QVBoxLayout, QWidget
-from PySide6.QtQuickWidgets import QQuickWidget
 
-from ui.dialogs.sequence_editor_qml import SequenceEditorQmlDialog
 from ui.pages.page_manual_qml import ValveModel, ValveBackend
 
 _QML_PATH = os.path.join(os.path.dirname(__file__), "PagePosition.qml")
@@ -135,6 +131,7 @@ class PreviewModel(QAbstractListModel):
 
 class PosBackend(QObject):
     changed = Signal()      # 포인트/네비/시퀀스 표시 갱신
+    monitorChanged = Signal()
 
     def __init__(self, page):
         super().__init__(page)
@@ -168,6 +165,16 @@ class PosBackend(QObject):
     seqIndex = Property(int, _si, notify=changed)
     hiRow = Property(int, _hi, notify=changed)
     teachEnabled = Property(bool, _te, notify=changed)
+    monitorRows = Property(
+        list, lambda self: self._p._sequence_monitor_rows(), notify=changed,
+    )
+    monitorPrograms = Property(
+        list, lambda self: self._p._sequence_monitor_programs(), notify=changed,
+    )
+    monitorRevision = Property(
+        int, lambda self: self._p._sequence_monitor_revision,
+        notify=monitorChanged,
+    )
 
     @Slot()
     def prevPoint(self):
@@ -201,16 +208,36 @@ class PosBackend(QObject):
     def openSeqEditor(self):
         self._p._open_sequence_editor()
 
+    @Slot(bool)
+    def setSequenceMonitorVisible(self, visible):
+        self._p._sequence_monitor_visible = bool(visible)
+        if visible:
+            self._p._sequence_monitor_revision += 1
+            self.monitorChanged.emit()
 
-class PagePositionQml(QWidget):
+    @Slot(str, int, result=bool)
+    def isSequenceStepActive(self, program, step_index):
+        instances = self._p._runtime_instances_by_sequence.get(str(program), {})
+        return int(step_index) in instances.values()
+
+    @Slot(str, result=bool)
+    def isSequenceRunning(self, program):
+        return bool(self._p._runtime_instances_by_sequence.get(str(program)))
+
+
+class PagePositionQml(QObject):
     sig_sequence_changed = Signal()
 
     def __init__(self, sequence_data=None, position_points=None,
                  view_order_data=None, mode_data=None, timer_library=None,
-                 plc_client=None, local_runtime=None):
+                 plc_client=None, local_runtime=None, overlay=None,
+                 sequence_editor=None):
         super().__init__()
         self.plc_client = plc_client
         self.local_runtime = local_runtime
+        self.qml_overlay = overlay
+        self.sequence_editor = sequence_editor
+        self._active = False
         self.raw_sequence_ref = sequence_data if sequence_data is not None else []
         self.position_points = position_points if position_points is not None else {}
         self.view_order_data = view_order_data if view_order_data is not None else []
@@ -233,6 +260,15 @@ class PagePositionQml(QWidget):
         self._current_op_status = 0
         self._hi_row = -1
         self._last_hi = None
+        # Keep execution highlights per program without taking ownership of
+        # the operator's program selector during parallel execution.
+        self._runtime_steps_by_sequence = {}
+        # One program may have several simultaneous parallel CALL instances.
+        # Keep their positions separately so the monitor does not rapidly
+        # overwrite one Sub program highlight with another instance's step.
+        self._runtime_instances_by_sequence = {}
+        self._sequence_monitor_visible = False
+        self._sequence_monitor_revision = 0
 
         self._init_points_from_sequence()
 
@@ -242,21 +278,6 @@ class PagePositionQml(QWidget):
         self._valve_be = ValveBackend(plc_client, self._valve_m, self)
         self._valve_be.load_configs()
         self._be = PosBackend(self)
-
-        self._view = QQuickWidget(self)
-        self._view.setResizeMode(QQuickWidget.SizeRootObjectToView)
-        self._view.setClearColor(QColor("#16202B"))
-        ctx = self._view.rootContext()
-        ctx.setContextProperty("axisModel", self._axis)
-        ctx.setContextProperty("previewModel", self._prev)
-        ctx.setContextProperty("valveModel", self._valve_m)
-        ctx.setContextProperty("valveBackend", self._valve_be)
-        ctx.setContextProperty("posBackend", self._be)
-        self._view.setSource(QUrl.fromLocalFile(_QML_PATH))
-
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.addWidget(self._view)
 
         if self.plc_client:
             self.plc_client.sig_monitor_data.connect(self._update_realtime_values)
@@ -310,7 +331,9 @@ class PagePositionQml(QWidget):
         return "위치 없음"
 
     def _seq_keys(self):
-        keys = sorted([k for k in self.sequences.keys() if k != "Main"])
+        keys = sorted([
+            k for k in self.sequences.keys() if k not in {"Main", "Monitor"}
+        ])
         return ["Main"] + keys
 
     def _seq_index(self):
@@ -347,35 +370,33 @@ class PagePositionQml(QWidget):
         if 0 <= idx < len(ks) and ks[idx] in self.sequences:
             self.current_seq_key = ks[idx]
             self._update_preview_list()
+            if self._current_op_status in (1, 2):
+                self._highlight_step(
+                    self._runtime_steps_by_sequence.get(self.current_seq_key, -1)
+                )
             self._be.changed.emit()
 
     # ---- preview 빌드 (PagePosition 와 동일 데코레이션) ----
     def _out_port_name(self, out_type, bit_index):
+        if out_type == 2:
+            try:
+                from utils.internal_bit_names import get_name
+                nm = get_name(f"M{bit_index:02d}")
+                return f"M{bit_index:02d} [{nm}]" if nm else f"M{bit_index:02d}"
+            except Exception:
+                return f"M{bit_index:02d}"
         try:
             from utils.io_manager import IOManager
             mgr = IOManager.instance()
-            if out_type == 0:
-                return f"Y{bit_index:02X}: {mgr.get_output_name(bit_index)}"
-            elif out_type == 1:
-                return f"Y{0x20+bit_index:02X}: {mgr.get_output_name(16+bit_index)}"
+            slot = mgr.group_slot(out_type)
+            return mgr.display_label(False, slot * 16 + bit_index)
         except Exception:
             pass
-        if out_type == 0:
-            return f"Y{bit_index:02X}"
-        if out_type == 1:
-            return f"Y{0x20+bit_index:02X}"
-        try:
-            from utils.internal_bit_names import get_name
-            nm = get_name(f"M{bit_index:02d}")
-            if nm:
-                return f"M{bit_index:02d}: {nm}"
-        except Exception:
-            pass
-        return f"M{bit_index:02d}"
+        return f"Y{bit_index:02X}"
 
-    def _in_port_name(self, port_index):
-        if 100 <= port_index <= 131:
-            bit_idx = port_index - 100
+    def _in_port_name(self, in_type, port_index):
+        if in_type == 2 or 100 <= port_index <= 131:
+            bit_idx = port_index - 100 if port_index >= 100 else port_index
             try:
                 from utils.internal_bit_names import get_name
                 nm = get_name(f"M{bit_idx:02d}")
@@ -387,10 +408,9 @@ class PagePositionQml(QWidget):
         try:
             from utils.io_manager import IOManager
             mgr = IOManager.instance()
-            if 0 <= port_index < 16:
-                return f"X{port_index:02X}: {mgr.get_input_name(port_index)}"
-            if 32 <= port_index < 48:
-                return f"X{port_index:02X}: {mgr.get_input_name(port_index - 16)}"
+            logical = port_index - 32 if in_type == 1 and port_index >= 32 else port_index
+            slot = mgr.group_slot(in_type)
+            return mgr.display_label(True, slot * 16 + logical)
         except Exception:
             pass
         return f"X{port_index:02X}" if port_index < 100 else f"포트{port_index}"
@@ -405,19 +425,23 @@ class PagePositionQml(QWidget):
             n += 1
         return f"스텝{target_idx}"
 
-    def _update_preview_list(self):
-        self._last_hi = None
+    def _preview_entries(self, sequence_name):
         rows = []
-        current_steps = self.sequences.get(self.current_seq_key, [])
+        current_steps = self.sequences.get(sequence_name, [])
         step_num = 0
+        executable_index = 0
         for step in current_steps:
             stype = step.get("type", "")
             if stype == "COMMENT":
-                rows.append((f"// {step.get('text', '')}", True))
+                rows.append({
+                    "text": f"// {step.get('text', '')}",
+                    "comment": True,
+                    "stepIndex": -1,
+                })
                 continue
             step_num += 1
             name = step.get("name", "Unknown")
-            if stype == "POS":
+            if stype in ("POS", "WPOS"):
                 p_name = step.get("point_name", "")
                 if p_name and p_name != name:
                     name = f"{name}  ({p_name})"
@@ -431,9 +455,10 @@ class PagePositionQml(QWidget):
                 on_val = step.get("on", step.get("on_off", False))
                 name = f"{name}  ({self._out_port_name(ot, port)} {'ON' if on_val else 'OFF'})"
             elif stype == "IN":
+                in_type = int(step.get("in_type", 0))
                 port = int(step.get("port", step.get("io_index", 0)))
                 on_val = step.get("on", step.get("on_off", True))
-                name = f"{name}  ({self._in_port_name(port)} {'ON' if on_val else 'OFF'})"
+                name = f"{name}  ({self._in_port_name(in_type, port)} {'ON' if on_val else 'OFF'})"
             elif stype == "JMP":
                 ti = int(step.get("target_idx", 0))
                 tn = self._jmp_target_name(current_steps, ti)
@@ -443,50 +468,161 @@ class PagePositionQml(QWidget):
                 ref = step.get("timer_ref", "")
                 if ref:
                     name = f"{name}  ({ref})"
-            rows.append((f"[{step_num:02d}] {name}", False))
-        self._prev.reset_rows(rows)
+            rows.append({
+                "text": f"[{step_num:02d}] {name}",
+                "comment": False,
+                "stepIndex": executable_index,
+            })
+            executable_index += 1
+        return rows
+
+    def _update_preview_list(self):
+        self._last_hi = None
+        rows = self._preview_entries(self.current_seq_key)
+        self._prev.reset_rows([
+            (entry["text"], entry["comment"]) for entry in rows
+        ])
         self._hi_row = -1
+
+    def _sequence_monitor_rows(self):
+        rows = []
+        for sequence_name in self._seq_keys():
+            active_step = self._runtime_steps_by_sequence.get(sequence_name, -1)
+            kind = "MAIN" if sequence_name == "Main" else (
+                "MONITOR" if sequence_name == "Monitor" else "SUB"
+            )
+            rows.append({
+                "header": True,
+                "program": sequence_name,
+                "kind": kind,
+                "text": sequence_name,
+                "comment": False,
+                "active": active_step >= 0,
+                "stepIndex": -1,
+            })
+            for entry in self._preview_entries(sequence_name):
+                rows.append({
+                    "header": False,
+                    "program": sequence_name,
+                    "kind": kind,
+                    "text": entry["text"],
+                    "comment": entry["comment"],
+                    "stepIndex": entry["stepIndex"],
+                    "active": (
+                        entry["stepIndex"] >= 0
+                        and entry["stepIndex"] == active_step
+                    ),
+                })
+        return rows
+
+    def _sequence_monitor_programs(self):
+        programs = []
+        for sequence_name in self._seq_keys():
+            kind = "MAIN" if sequence_name == "Main" else "SUB"
+            programs.append({
+                "program": sequence_name,
+                "kind": kind,
+                "steps": [
+                    {
+                        "text": entry["text"],
+                        "comment": entry["comment"],
+                        "stepIndex": entry["stepIndex"],
+                    }
+                    for entry in self._preview_entries(sequence_name)
+                ],
+            })
+        return programs
 
     # ---- 실시간 (PagePosition._update_realtime_values 와 동일) ----
     def _update_realtime_values(self, data):
-        if isinstance(data, dict):
-            # Manual page keeps the valve lock/status in sync from the same
-            # monitor packet; mirror that here so the shared valve tiles do
-            # not show stale state on the position page.
-            op_status = data.get('op_status', 0)
-            self._valve_be.set_locked(op_status in (1, 2))
-        else:
-            op_status = 0
+        is_monitor = isinstance(data, dict)
+        has_runtime_state = is_monitor and 'op_status' in data
 
-        if not self.isVisible():
+        # PLC monitor packets and pendant-runtime packets arrive independently.
+        # The PLC-only packet intentionally has no op_status/current_step, so it
+        # must not be treated as an idle packet or it will clear the execution
+        # highlight and unlock the controls between every runtime update.
+        if has_runtime_state:
+            self._current_op_status = data['op_status']
+            self._valve_be.set_locked(self._current_op_status in (1, 2))
+
+            current_step = data.get('current_step', -1)
+            op_status = self._current_op_status
+            background_sequence = bool(data.get('background_sequence', False))
+            target_name = data.get('local_sequence') or "Main"
+
+            if background_sequence:
+                if (target_name and target_name != "Monitor"
+                        and target_name in self.sequences):
+                    self._track_runtime_step(target_name, current_step, data)
+            elif op_status in (1, 2):
+                if data.get('pendant_sequence') or data.get('local_dio'):
+                    target_name = data.get('local_sequence') or "Main"
+                else:
+                    current_slot = data.get('sub_seq_idx', 0)
+                    target_name = self._get_seq_name_by_slot(current_slot)
+                if target_name and target_name in self.sequences:
+                    self._track_runtime_step(target_name, current_step, data)
+            else:
+                # Main stopping must not erase a Sub independently running
+                # under the always-on Monitor executor.
+                self._clear_runtime_source("main")
+
+            if self._active:
+                self._be.changed.emit()
+                self._highlight_step(
+                    self._runtime_steps_by_sequence.get(
+                        self.current_seq_key, -1
+                    )
+                )
+            if self._sequence_monitor_visible:
+                self._sequence_monitor_revision += 1
+                self._be.monitorChanged.emit()
+
+        if not self._active:
             return
-        axis_data = data.get('axis_pos', []) if isinstance(data, dict) else data
+        axis_data = data.get('axis_pos', []) if is_monitor else data
         self._axis.set_cur(axis_data)
 
-        if isinstance(data, dict) and 'outputs' in data:
+        if is_monitor and 'outputs' in data:
             outs = data['outputs']
             if outs and len(outs) >= 2:
                 self._valve_be.sync_from_outputs(outs)
 
-        current_step = data.get('current_step', -1) if isinstance(data, dict) else -1
-        self._current_op_status = op_status
-        self._be.changed.emit()
-
-        if op_status in (1, 2):
-            if isinstance(data, dict) and data.get('local_dio'):
-                target_name = data.get('local_sequence') or "Main"
-            else:
-                current_slot = data.get('sub_seq_idx', 0) if isinstance(data, dict) else 0
-                target_name = self._get_seq_name_by_slot(current_slot)
-            if target_name and target_name != self.current_seq_key \
-                    and target_name in self.sequences:
-                self.current_seq_key = target_name
-                self._update_preview_list()
-                self._last_hi = None
-                self._be.changed.emit()
-            self._highlight_step(current_step)
+    def _track_runtime_step(self, target_name, current_step, data):
+        execution_id = int(data.get('local_execution_id', 0) or 0)
+        source = str(data.get('local_execution_source', 'main') or 'main')
+        instance_key = (source, execution_id)
+        instances = self._runtime_instances_by_sequence.setdefault(
+            target_name, {}
+        )
+        if current_step >= 0:
+            instances[instance_key] = current_step
+            self._runtime_steps_by_sequence[target_name] = current_step
+            return
+        instances.pop(instance_key, None)
+        if instances:
+            self._runtime_steps_by_sequence[target_name] = next(
+                reversed(instances.values())
+            )
         else:
-            self._highlight_step(-1)
+            self._runtime_instances_by_sequence.pop(target_name, None)
+            self._runtime_steps_by_sequence.pop(target_name, None)
+
+    def _clear_runtime_source(self, source):
+        source = str(source)
+        for target_name in list(self._runtime_instances_by_sequence):
+            instances = self._runtime_instances_by_sequence[target_name]
+            for key in list(instances):
+                if key[0] == source:
+                    instances.pop(key, None)
+            if instances:
+                self._runtime_steps_by_sequence[target_name] = next(
+                    reversed(instances.values())
+                )
+            else:
+                self._runtime_instances_by_sequence.pop(target_name, None)
+                self._runtime_steps_by_sequence.pop(target_name, None)
 
     def _get_seq_name_by_slot(self, slot_id):
         MONITOR_KEY = "Monitor"
@@ -538,7 +674,7 @@ class PagePositionQml(QWidget):
             maximum = get_axis_strokes()[row_idx] if 0 <= row_idx < 8 else 1000.0
         else:
             maximum = 100
-        self.window().qml_overlay.request_number(
+        self.qml_overlay.request_number(
             f"{selected_point} {_AXES[row_idx]} {col_type}", float(current_val_str),
             decimal=col_type == "coords", minimum=0 if col_type == "coords" else 1,
             maximum=maximum, callback=finished,
@@ -556,7 +692,7 @@ class PagePositionQml(QWidget):
             from utils.axis_limits import get_axis_strokes
             stroke = get_axis_strokes()[row_idx] if 0 <= row_idx < 8 else 1000.0
             if new_val < 0.0 or new_val > stroke:
-                self.window().qml_overlay.show_message(
+                self.qml_overlay.show_message(
                     "입력 범위 초과",
                     f"스트로크 한계를 벗어났습니다.\n허용 범위: 0 ~ {stroke:.3f} mm\n입력값: {new_val:.3f} mm",
                     error=True,
@@ -592,7 +728,7 @@ class PagePositionQml(QWidget):
         axis_name = _AXES[row_idx] if 0 <= row_idx < 8 else f"{row_idx+1}"
         from utils.axis_limits import get_axis_strokes
         stroke = get_axis_strokes()[row_idx] if 0 <= row_idx < 8 else 1000.0
-        self.window().qml_overlay.request_fine_adjust(
+        self.qml_overlay.request_fine_adjust(
             f"{axis_name}축 미세조정", cur, 0, stroke,
             callback=lambda delta: self._apply_fine_adjust(selected_point, row_idx, delta),
         )
@@ -606,7 +742,7 @@ class PagePositionQml(QWidget):
         from utils.axis_limits import get_axis_strokes
         stroke = get_axis_strokes()[row_idx] if 0 <= row_idx < 8 else 1000.0
         if new_val < 0.0 or new_val > stroke:
-            self.window().qml_overlay.show_message(
+            self.qml_overlay.show_message(
                 "입력 범위 초과",
                 f"스트로크 한계를 벗어났습니다.\n허용 범위: 0 ~ {stroke:.3f} mm\n입력값: {new_val:.3f} mm", error=True,
             )
@@ -664,7 +800,7 @@ class PagePositionQml(QWidget):
         ordered = list(self._visible_points)
         current = self._point_name()
         current_index = ordered.index(current) if current in ordered else -1
-        self.window().qml_overlay.request_selection(
+        self.qml_overlay.request_selection(
             "포인트 선택", ordered, current_index,
             callback=lambda accepted, index, name: self._on_point_selected_from_card(name) if accepted else None,
         )
@@ -682,18 +818,13 @@ class PagePositionQml(QWidget):
             self.view_order_data.extend(new_order)
             self._refresh_ui()
             self.sig_sequence_changed.emit()
-        self.window().qml_overlay.request_reorder(
+        self.qml_overlay.request_reorder(
             "포인트 순서 변경", list(self.view_order_data), callback=finished,
         )
 
     def _open_sequence_editor(self):
-        dlg = SequenceEditorQmlDialog(
-            sequence_data=self.sequences,
-            position_points=self.position_points,
-            timer_library=self.timer_library,
-            plc_client=self.plc_client,
-            mode_data=self.mode_data,
-            parent=self)
+        if self.sequence_editor is None:
+            return
         def finished(accepted, editor):
             if not accepted:
                 return
@@ -707,18 +838,32 @@ class PagePositionQml(QWidget):
                     self.raw_sequence_ref.extend(self.sequences["Main"])
             self.position_points.clear()
             self.position_points.update(new_points)
+            refresh_monitor = getattr(
+                self.local_runtime, "refresh_monitor_sequence", None
+            )
+            if callable(refresh_monitor):
+                refresh_monitor()
             self._refresh_ui()
             self.sig_sequence_changed.emit()
-        dlg.open(finished)
+        self.sequence_editor.open(
+            sequence_data=self.sequences,
+            position_points=self.position_points,
+            timer_library=self.timer_library,
+            mode_data=self.mode_data,
+            callback=finished,
+        )
 
     # ---- 호환 (main_window 가 _refresh_ui() 호출) ----
-    def showEvent(self, event):
+    def activate(self):
+        self._active = True
         self._refresh_ui()
         if self._visible_points:
             self._pt_index = 0
             self._load_selected_point()
-        super().showEvent(event)
         QTimer.singleShot(0, self._check_axis_visibility)
+
+    def deactivate(self):
+        self._active = False
 
     def _check_axis_visibility(self):
         try:

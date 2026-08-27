@@ -6,6 +6,8 @@ import QtQuick.Controls
 
 Rectangle {
     id: root
+    required property var modeModel
+    required property var backend
     // .GlassCard 와 동일 (rgba(15,22,30,150), radius 16)
     color: "#660F161E"
     radius: 16

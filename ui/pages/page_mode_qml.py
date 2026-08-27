@@ -1,21 +1,9 @@
-"""
-PoC: 동작모드 페이지 QML(GPU) 버전.
-
-- UI: PageMode.qml (Qt Quick GridView = GPU 씬그래프 + 키네틱 스크롤)
-- 로직: 기존 PageMode 와 동일 (인터록 mandatory/exclusive, PLC 송신,
-  ModeManager 이름, op_history) — 전부 Python 유지.
-- main_window 의 PageMode 와 생성자/메서드 호환 (drop-in).
-
-QWidget 스택에 QQuickWidget 으로 임베드 → 기존 앱에 점진 이식 가능.
-"""
+"""동작 모드 페이지의 비시각 QML 백엔드 컨트롤러."""
 import json
 import os
 
-from PySide6.QtCore import (Qt, QObject, Signal, Slot, QUrl,
+from PySide6.QtCore import (Qt, QObject, Signal, Slot,
                             QAbstractListModel, QModelIndex, QByteArray)
-from PySide6.QtGui import QColor
-from PySide6.QtWidgets import QVBoxLayout, QWidget
-from PySide6.QtQuickWidgets import QQuickWidget
 
 from utils.json_utils import load_json, save_json
 from utils.paths import get_settings_path as _get_settings_path
@@ -83,14 +71,15 @@ class ModeBackend(QObject):
         self._p._rename_mode(idx)
 
 
-class PageModeQml(QWidget):
+class PageModeQml(QObject):
     """PageMode 의 QML(GPU) 드롭인 대체. 생성자/메서드 호환."""
 
     _SETTINGS_PATH = _get_settings_path()
 
-    def __init__(self, mode_data=None, plc_client=None):
+    def __init__(self, mode_data=None, plc_client=None, overlay=None):
         super().__init__()
         self.plc_client = plc_client
+        self.qml_overlay = overlay
         self.mode_data = mode_data if mode_data is not None else []
         if len(self.mode_data) < TOTAL_SLOTS:
             self.mode_data.extend([False] * (TOTAL_SLOTS - len(self.mode_data)))
@@ -100,20 +89,6 @@ class PageModeQml(QWidget):
 
         self._model = ModeTileModel(self.mode_data, self._get_mode_name, self)
         self._backend = ModeBackend(self)
-
-        self._view = QQuickWidget(self)
-        self._view.setResizeMode(QQuickWidget.SizeRootObjectToView)
-        # QQuickWidget 기본 clear color = 흰색. 반투명 글래스 QML 루트가
-        # 그 위에 깔리면 뿌옇게 됨 → 테마 #Root 다크로 맞춰 합성.
-        self._view.setClearColor(QColor("#16202B"))
-        ctx = self._view.rootContext()
-        ctx.setContextProperty("modeModel", self._model)
-        ctx.setContextProperty("backend", self._backend)
-        self._view.setSource(QUrl.fromLocalFile(_QML_PATH))
-
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.addWidget(self._view)
 
         if ModeManager:
             ModeManager.instance().sig_names_changed.connect(self.refresh_ui)
@@ -146,7 +121,7 @@ class PageModeQml(QWidget):
                 if on_count == 0:
                     self.mode_data[idx] = True
                     self._model.refresh_row(idx)
-                    overlay = getattr(self.window(), "qml_overlay", None)
+                    overlay = self.qml_overlay
                     if overlay:
                         overlay.show_message(
                             "설정 불가",
@@ -167,14 +142,13 @@ class PageModeQml(QWidget):
                         self._model.refresh_row(other)
 
         self._model.refresh_row(idx)
-        if self.plc_client and self.plc_client.is_connected:
-            self.plc_client.submit(self.plc_client.send_mode_settings, list(self.mode_data))
+        # User-mode conditions are evaluated by the pendant executor.
 
     def _rename_mode(self, idx):
         if not ModeManager:
             return
         current = ModeManager.instance().get_name(idx)
-        overlay = getattr(self.window(), "qml_overlay", None)
+        overlay = self.qml_overlay
         if overlay:
             overlay.request_text(
                 "모드 이름 변경", current,
@@ -209,7 +183,9 @@ class PageModeQml(QWidget):
     def update_language(self, lang_code=None):
         self._model.refresh_all()
 
-    def showEvent(self, event):
+    def activate(self):
         (self.interlock_groups, self.interlock_mandatory,
          self.interlock_exclusive) = self._load_interlock_groups()
-        super().showEvent(event)
+
+    def deactivate(self):
+        pass

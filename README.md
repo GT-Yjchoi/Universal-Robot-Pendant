@@ -45,7 +45,7 @@ I8O8의 논리 출력 0~7은 통합 프로토콜 비트맵의 bit 8~15에 대응
 기본값인 `control_backend=plc`에서도 레시피 제어 흐름은 Raspberry Pi의
 `SequenceExecutor`가 실행한다. `POS`, `OUT`, `IN`, `TMR`, `JMP`, `CALL`, `DAT`,
 `END`, `COMMENT`를 지원하며 별도 `Monitor` 시퀀스도 팬던트에서 실행한다. PLC에는
-전체 레시피를 내려보내지 않고 `DT300..DT354` 명령 메일박스로 서보 이동과 물리 출력
+전체 레시피를 내려보내지 않고 `DT300..DT342` 요청 및 `DT400..DT404` 응답 메일박스로 서보 이동과 물리 출력
 명령만 전달한다. 계약과 ST 초안은 `plc/FP0H_PENDANT_MAILBOX.md`를 참고한다.
 
 `control_backend=ezi_io`는 서보가 없는 Ezi-IO 시험용 경로다. QML 시퀀스 편집기는
@@ -56,10 +56,11 @@ POS 활성축을 보존한다. 이전 QWidget 구현은 소스 호환·참고용
 ### QML 화면과 통신 스레드
 
 상단바, 하단 내비게이션, 8개 페이지, 알람/JOG/키패드/키보드/확인/선택/이력 팝업은
-Qt Quick/QML로 렌더링한다. PLC 모니터 데이터는 변경된 모델 행만 `dataChanged`로
-갱신하고 숨겨진 페이지는 최신 패킷만 보관한다. 사용자 명령은 PLC 클라이언트의 단일
-FIFO 백엔드 큐에서 실행하므로 화면 스레드가 TCP 응답을 기다리지 않으며 모멘터리
-ON/OFF 순서가 보장된다.
+하나의 `QQmlApplicationEngine`과 `ApplicationWindow`에서 렌더링한다. 실행 경로에는
+`QQuickWidget`이나 QWidget 화면이 없으며 `Loader`가 현재 페이지 하나만 생성한다.
+PLC 모니터 데이터는 변경된 모델 행만 `dataChanged`로 갱신하고 숨겨진 페이지는 최신
+패킷만 보관한다. TCP 읽기·쓰기·하트비트는 단일 전용 통신 코어에서 직렬화하며,
+JOG·정지·비상정지 명령은 우선순위 큐를 통해 주기 모니터링보다 먼저 처리한다.
 
 ---
 
@@ -67,14 +68,14 @@ ON/OFF 순서가 보장된다.
 
 ```
 Pendant/
-├── main.py                        # 진입점 (QApplication, PLCClient, MainWindow) + 스크린샷 핫키(F12) / 우상단 3초 롱프레스
+├── main.py                        # 진입점 (QGuiApplication + 단일 QQmlApplicationEngine)
 ├── main.spec                      # PyInstaller 빌드 스펙
 ├── pendant-rpi-lite.service       # Raspberry Pi OS Lite 자동 실행 서비스
 ├── launch-rpi-lite.sh             # Weston DRM kiosk + 앱 실행기
 ├── weston-rpi.ini                 # DSI 출력과 화면 회전 설정
 ├── settings.json                  # 사용자 설정 (PLC IP/Port, 밸브, IO 이름, 축 등)
 ├── style.qss                      # 전역 스타일시트 (Fusion 기반)
-├── new_plc_fb.st                  # PLC 펑션블록 (현재 사용, 3-instance + 콜스택 + 파렛타이징 통합)
+├── new_plc_fb.st                  # [legacy] 과거 PLC 스텝 실행기 참고본
 ├── fb_WriteMotionTable.st         # RTEX 모션 테이블 일괄 쓰기 FB (포인트 60개 분량)
 ├── fb_MainAxis.st                 # 메인 축 제어 FB
 ├── fb_RTEX_Amp_Param.st           # RTEX 앰프 파라미터 FB
@@ -85,8 +86,14 @@ Pendant/
 ├── alarm_history.json             # 알람 발생 이력 (최근 30일, .gitignore 대상)
 ├── op_history.json                # 사용자 조작 이력 (최근 7일, .gitignore 대상)
 │
+├── plc/
+│   ├── FB_PendantMailbox.st       # 현재 PLC 하드웨어 명령 실행 FB
+│   ├── FB_PendantWatchdog.st      # DT200 통신 Watchdog FB
+│   ├── FP0H_PENDANT_MAILBOX.md    # 최종 배선·안전·에러코드 문서
+│   └── FP0H_DEPLOY_CHECKLIST_KR.md # FPWIN 적용·무부하 시험 순서
+│
 ├── ui/                            # UI 레이어
-│   ├── main_window.py             # 메인 윈도우 (페이지 스택, 네비게이션, 알람 오버레이)
+│   ├── main_window.py             # [legacy] QWidget 메인 윈도우 참고본
 │   ├── top_bar.py                 # 상단 바 (통신·모드·알람 상태, JOG 버튼)
 │   ├── theme.py                   # 전역 테마
 │   ├── overlays/
@@ -94,7 +101,7 @@ Pendant/
 │   │   └── alarm_history_overlay.py  # 이력 팝업 (알람 30일 / 조작 7일 탭)
 │   ├── pages/
 │   │   ├── page_manual.py         # 수동 운전 페이지 (밸브 수동 제어)
-│   │   ├── page_auto.py           # 자동 운전 페이지 (시퀀스 실행, 확인운전, 전체속도 조절)
+│   │   ├── page_auto.py           # [legacy] QWidget 자동운전 페이지 참고본
 │   │   ├── page_mode.py           # 모드 설정 페이지 (40개 모드 On/Off)
 │   │   ├── page_position.py       # 포인트 관리 + 시퀀스 미리보기 + 자동 중 미세조정
 │   │   ├── page_timer.py          # 타이머 설정 페이지 (TMR 스텝 시간 편집)
@@ -149,8 +156,8 @@ Pendant/
 
 - **대상 PLC**: 파나소닉 FP 시리즈 (FPWIN Pro, ST 프로그래밍)
 - **프로토콜**: TCP, `DEST_UNIT=0x01`, 12바이트 헤더 프레임
-- **모니터링**: DT100~DT163 (64 Words) 를 50ms 주기로 폴링
-- **하트비트**: 통신 성공마다 DT214에 0~100 순환값 전송
+- **모니터링**: DT100~DT167 (68 Words) 를 통신 코어에서 주기적으로 폴링
+- **하트비트**: DT200에 순환값 전송
 - **자동 재연결**: 통신 끊김 시 5초 간격으로 재연결 시도
 
 #### PLC 메모리 맵
@@ -158,44 +165,36 @@ Pendant/
 | 영역 | 주소 | 내용 |
 |---|---|---|
 | **모니터링 (PLC→HMI)** | DT100~115 | 8축 현재 위치 (DINT×8, 0.001mm 단위) |
-| | DT116~119 | 입력(X) 상태 (WORD×4, 64점) |
-| | DT120~123 | 출력(Y) 상태 (WORD×4). 이 PLC 는 `DT120=Y00~Y0F`, `DT121=Y20~Y2F` 매핑 |
-| | DT124~125 | 밸브 동작 상태 (32개 밸브 비트) |
-| | DT126 | 병렬 워커2 실행 슬롯 (FB_Worker2.i_CurrentSlot, 0=idle) |
-| | DT127 | 병렬 워커2 실행 스텝 (FB_Worker2.i_CurrentStep) |
-| | DT128 | 미사용 |
-| | DT129 | 운전 상태 (op_status: 0=정지, 1=자동, 2=확인운전) |
-| | DT130 | 확인운전 상태 (check_run_status) |
-| | DT131 | 현재 실행 스텝 (FB.i_CurrentStep, 스택 top 기준) |
-| | DT132 | 현재 실행 슬롯 (FB.i_CurrentSlot: Main=0, 서브=1~N) |
-| | DT133 | 콜 스택 깊이 (FB.i_StackDepth, 0~3) |
-| | DT134 | 병렬 워커1 실행 슬롯 (FB_Sub.i_CurrentSlot, 0=idle) |
-| | DT135 | 병렬 워커1 실행 스텝 (FB_Sub.i_CurrentStep) |
-| | DT136~137 | 총 취출 횟수 (DINT) |
-| | DT138~139 | 현재 성형 시간 (DINT, 0.1초 단위) |
-| | DT140~141 | 현재 취출 시간 (DINT, 0.1초 단위) |
-| | DT142 | 축 알람 비트맵 (bit0~7=1~8축, bit8=비상정지) |
-| | DT143~158 | 축별 에러코드 (DINT×8축) |
-| | DT159 | 사용자 알람 (`w_UserAlarm`, IN 스텝 P3=1/2 발동, 핸드셰이크: HMI 수신 후 0으로 클리어) |
-| | DT160 | 스텝 알람 ID (`i_StepAlarmID`, 0=정상, 21/22/50/93~99) |
-| | DT161~163 | **파렛타이징 현재 인덱스** (`gi_PackIdxX/Y/Z`, INT×3, 0-based, HMI 양방향 R/W) |
-| **제어 (HMI→PLC)** | DT200 | 운전 제어 (0=정지, 1=자동, 2=확인운전) |
-| | DT201 | 조작압 선택 (0=제품압, 1=티칭압) |
-| | DT202 | 확인운전 제어 (상승엣지로 1스텝 진행) |
-| | DT204~205 | 밸브 수동 제어 (2 Words, 32비트) |
-| | DT205 | 조그 제어 (비트별 축) |
-| | DT206~208 | 모드 설정 (40개 모드 비트팩, 3 Words) |
-| | DT211 | 조그 속도 |
-| | DT212 | 알람 리셋 상승펄스 → `b_AlarmReset` 으로 배선 |
-| | DT213 | 소프트 비상정지 (0=정상, 1=비상정지) |
-| | DT214 | 하트비트 (0~100 순환) |
-| | DT215 | 수동조작 모드 (0=앱솔루트, 1=JOG) |
-| | DT216 | 전체 속도 배율 (`gi_SpeedOverride`, 1~10 단계, 자동/확인운전 공통) |
-| **파렛타이징 설정** | DT217 | 패킹 마스터 ON/OFF (`gw_PackEnable`, 0=미사용, 1=사용) — **commit pattern**: 설정 변경 시 가장 나중에 씀 |
-| | DT218~223 | X/Y/Z 피치 (`gdi_PitchX/Y/Z`, DINT×3, 0.001mm 단위) |
-| | DT224~226 | X/Y/Z 방향 (`gi_DirX/Y/Z`, INT×3, +1 정방향 / −1 역방향. Z 는 기본 −1 = 위로 쌓기) |
-| | DT227~229 | X/Y/Z 적층 횟수 (`gi_CountX/Y/Z`, INT×3) |
-| | DT230 | 적층 순서 (`gi_StackOrder`, 0~5: XYZ/XZY/YXZ/YZX/ZXY/ZYX) |
+| | DT116 | 축 알람·비상정지 비트맵 (bit0~7=1~8축, bit8=비상정지) |
+| | DT117 | 8축 원점완료 비트맵 (bit0~7=1~8축) |
+| | DT118~119 | 예약 |
+| | DT120~135 | 8축 에러코드 (DINT×8) |
+| | DT136~139 | 예약 |
+| | DT140~143 | 실제 입력 X00~X3F 상태 (WORD×4, 비압축) |
+| | DT144~147 | 실제 출력 Y00~Y3F 상태 (WORD×4, 비압축) |
+| | DT148~149 | 예약 |
+| | DT150 | PLC 운전모드 상태 |
+| | DT151~159 | 예약 |
+| | DT160~161 | 생산/취출횟수 (DINT) |
+| | DT162~163 | 목표횟수 (DINT) |
+| | DT164~165 | 취출 싸이클시간 (DINT, 0.1초 단위) |
+| | DT166~167 | 성형 싸이클시간 (DINT, 0.1초 단위) |
+| **팬던트→PLC** | DT200 | 통신 하트비트 |
+| | DT201 | 팬던트가 관리하는 현재 운전상태 |
+| | DT202~209 | 예약 |
+| | DT210~213 | 출력 요청 Y00~Y3F (WORD×4, 비압축) |
+| | DT214~219 | 예약 |
+| | DT220 | 축 JOG 명령 비트 |
+| | DT221 | JOG 속도 |
+| | DT222 | 전체 속도 배율 |
+| | DT223 | 축 정지 요청 |
+| | DT224~299 | 예약 |
+| **명령 메일박스** | DT300~342 | 출력·펄스·모션·원점·정지·리셋 요청 |
+| | DT332~341 | 예약 (가감속은 PLC 시스템 파라미터를 MoveAbsolute에 직접 연결) |
+| | DT342 | 요청번호/Commit |
+| | DT343~399 | 예약 |
+| | DT400~404 | 명령 ACK·상태·오류 |
+| | DT405~499 | 예약 |
 | **축 파라미터** | DT15000~15049 | 8축 공통 설정 블록 (50 Words) |
 | | DT15000 | 축 사용 비트마스크 (bit0~7 = 1~8축) → FB 의 `w_AxisEnable` |
 | | DT15001~15008 | 8축 운전 방향 (0=정방향, 1=역방향) |
@@ -203,11 +202,13 @@ Pendant/
 | | DT15025~15032 | 8축 가감속 시간 (WORD×8) |
 | | DT15033 | 축 데이터셋 전송 트리거 (버튼 누름 시 축 비트 ON) |
 | | DT15034~15049 | 8축 PPR — 서보 1회전당 지령펄스수 (DINT×8) |
-| **포인트 데이터** | DT16000~DT17919 | 포인트당 32 Words × **최대 60 포인트** (`g_Dut_Point[0..59]`) |
-| **시퀀스 데이터** | DT20000~ | 슬롯당 1000 Words (100스텝 × 10Words) × 최대 40슬롯 (DT20000~DT59999) |
+| **구형 포인트 데이터** | DT16000~DT17919 | 현재 팬던트 실행 방식에서는 미사용 |
+| **구형 시퀀스 데이터** | DT20000~DT59999 | 현재 팬던트 실행 방식에서는 미사용 |
 
 > 포인트 인덱스 `i` 의 시작 주소 = `DT16000 + i × 32`
 > 슬롯 `s` 의 스텝 `k` 시작 주소 = `DT20000 + s × 1000 + k × 10`
+
+최종 기준은 [`DT_ADDRESS_MAP.md`](DT_ADDRESS_MAP.md)를 따른다.
 
 #### RTEX 모션 테이블 할당 정책 (64개)
 
@@ -285,7 +286,10 @@ bit 3 : 4축 (Y2)     bit 7 : 8축 (R2)
 
 ---
 
-### PLC 펑션블록 (`new_plc_fb.st`) — 3-instance + 내부 콜 스택
+### [Legacy] PLC 펑션블록 (`new_plc_fb.st`) — 현재 실행 경로에서 미사용
+
+> 아래 내용은 과거 PLC 스텝 실행기 보관 자료입니다. 현재는 Raspberry Pi의
+> `SequenceExecutor`가 스텝을 해석하며 PLC는 `plc/FB_PendantMailbox.st`만 실행합니다.
 
 시퀀스 실행 FB 는 **3개 인스턴스**로 배선. 동기 CALL 은 FB 내부 콜 스택(4레벨)으로 처리하고, 병렬 CALL 은 워커 2개 중 빈 워커로 외부 기동합니다.
 
@@ -369,7 +373,7 @@ FB_Worker2 (병렬 워커2, b_NoSubCall=TRUE)
 
 ### 파렛타이징 (Palletizing)
 
-베이스 포인트에서 X/Y/Z 오프셋을 자동으로 더해 팔레트 적재 위치로 이동시키는 기능. 로직은 **PLC (new_plc_fb.st) 안에 통합** 되어 있으며, HMI 는 설정 UI + pack_idx 관리만 담당.
+베이스 포인트에서 X/Y/Z 오프셋을 자동으로 더해 팔레트 적재 위치로 이동시키는 기능입니다. 현재 로직은 팬던트의 `PLCSequenceRuntime._transform_position()`이 처리합니다.
 
 #### 시퀀스 스텝에서 pack_base 지정
 
@@ -446,8 +450,8 @@ HMI 가 PLC 에 새로 연결되거나 레시피가 교체될 때 **백그라운
 
 | 카테고리 | 발생 시점 |
 |---|---|
-| `ESTOP` | DT142 bit8 또는 GPIO E-STOP 활성화 |
-| `AXIS` | 축 서보 알람 (DT142 bit0~7) |
+| `ESTOP` | DT116 bit8 또는 GPIO E-STOP 활성화 |
+| `AXIS` | 축 서보 알람 (DT116 bit0~7) |
 | `STEP` | `i_StepAlarmID` ≠ 0 |
 | `USER` | IN 스텝 P3=1/2 에서 발동한 사용자 정의 알람 |
 | `COMM` | PLC TCP 통신 끊김 |
@@ -567,7 +571,7 @@ HMI 가 PLC 에 새로 연결되거나 레시피가 교체될 때 **백그라운
 ### 수동 운전 페이지 & 위치 설정 우측 밸브 패널
 
 - `valve_tile.ValvePanel` 공용 컴포넌트
-- **출력 상태 실시간 동기화**: DT120/DT121 기반으로 토글 버튼 상태가 실제 Y 출력과 항상 일치
+- **출력 상태 실시간 동기화**: DT144~DT147 기반으로 토글 버튼 상태가 실제 Y 출력과 항상 일치
 - **자동/확인운전 중 조작 차단**: 반투명 오버레이 + "자동 중에는 사용할 수 없습니다" 안내
 - Toggle / Momentary 모드 지원 (`settings.json` → `valve_config.mode`)
 
@@ -833,17 +837,18 @@ JMP 스텝의 `target_idx` 는 콤보 인덱스 = **원본 리스트 인덱스 (
 
 | 목적 | 파일 |
 |---|---|
-| PLC IP/Port 기본값 | `ui/main_window.py` → `_try_auto_connect` |
+| PLC IP/Port 기본값 | `ui/qml_controller.py` → `_try_auto_connect` |
 | 사용자 알람 메시지 (IN 스텝) | 설정 페이지 > 알람 탭 (또는 `settings.json` `sequence_alarms`) |
 | 밸브 이름·모드·JOG 노출 | 설정 페이지 > 밸브 탭 (또는 `settings.json` `valve_config`) |
 | IO 이름 변경 | 설정 페이지 > IO 탭 (또는 `settings.json` `io_names`) |
 | 축 설정 (사용여부·스트로크·가감속·PPR) | 설정 페이지 > 축 파라미터 (또는 `settings.json` `axis_uses`·`axis_strokes`) |
 | 내부비트 이름 | 시퀀스 편집기 OUT/IN 스텝 → 내부비트 카드 ✎ 아이콘 |
-| 모니터링 주기 변경 | `utils/plc_client.py` → `_mon_loop` (`time.sleep`) |
+| 모니터링 주기 변경 | `utils/plc_client.py` → `_command_loop` / `_next_monitor_at` |
 | PLC 주소 상수 | `utils/plc_client.py` → `__init__` 상단 |
-| 시퀀스 FB 로직 | `new_plc_fb.st` |
-| 페이지 추가 | `ui/pages/` 생성 후 `ui/main_window.py` 에 등록 |
-| 네비게이션 버튼 순서 | `ui/main_window.py` → `add_nav(...)` 호출 순서 |
+| PLC 하드웨어 명령 FB | `plc/FB_PendantMailbox.st` |
+| PLC 통신 Watchdog | `plc/FB_PendantWatchdog.st` |
+| 페이지 추가 | `ui/qml/PendantMain.qml`과 `ui/qml_controller.py`에 등록 |
+| 네비게이션 버튼 순서 | `ui/qml/components/BottomNav.qml` |
 | 이력 보존 기간 | `utils/alarm_history.py` (RETENTION_DAYS=30) / `utils/op_history.py` (=7) |
 | 이력 팝업 페이지 크기 | `ui/overlays/alarm_history_overlay.py` → `PAGE_SIZE` (기본 100) |
 | 포인트 최대 개수 | `utils/plc_client.py` → `MAX_POINTS` (기본 60) + `fb_WriteMotionTable.st` + `new_plc_fb.st` |

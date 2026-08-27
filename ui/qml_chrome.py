@@ -49,7 +49,7 @@ class TopBarBackend(QObject):
             self._recipe = recipe; self.changed.emit()
 
     def update_monitor(self, data):
-        status = int(data.get("op_status", 0))
+        status = int(data.get("op_status", self.op_status))
         alarms = list(data.get("axis_alarms", []))
         if status == 1:
             mode, color = "모드: 자동운전", "#2ecc71"
@@ -132,4 +132,3 @@ class QmlBottomBar(QWidget):
 
     def set_current(self, index): self._backend.set_current(index)
     def set_labels(self, labels): self._backend.set_labels(labels)
-

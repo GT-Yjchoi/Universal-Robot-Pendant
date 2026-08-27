@@ -614,17 +614,47 @@ class MainWindow(QWidget):
         self._alarm_resetting = False
 
     def _on_pendant_timeout(self, request):
+        queue = getattr(self, "_pending_timeout_requests", None)
+        if queue is None:
+            self._pending_timeout_requests = []
+            self._active_timeout_request = None
+            queue = self._pending_timeout_requests
+        queue.append(request)
+        self._show_next_pendant_timeout()
+
+    def _show_next_pendant_timeout(self):
+        if (getattr(self, "_active_timeout_request", None) is not None
+                or not getattr(self, "_pending_timeout_requests", [])):
+            return
+        request = self._pending_timeout_requests.pop(0)
+        self._active_timeout_request = request
         step = request.step
         alarm_no = int(step.get("timeout_alarm_no", 0))
         name = step.get("name", f"입력 {step.get('port', 0)}")
-        message = f"'{name}' 입력 대기시간이 초과되었습니다."
+        message = (
+            f"'{name}' 입력 대기시간이 초과되었습니다.\n"
+            "이 프로그램만 현재 IN 스텝에서 대기 중이며,\n"
+            "다른 병렬 프로그램과 Monitor는 계속 실행됩니다."
+        )
         if alarm_no:
             message += f"\n알람 A-{alarm_no:03d}"
+        record_alarm("USER", alarm_no, message)
         self.qml_overlay.request_confirm(
-            "입력 타임아웃", message,
-            accept_text="다음 진행", reject_text="정지",
-            callback=request.resolve,
+            "입력 타임아웃 · 진행여부 선택", message,
+            accept_text="리셋", reject_text="정지",
+            callback=lambda reset: self._finish_pendant_timeout(request, reset),
         )
+
+    def _finish_pendant_timeout(self, request, reset):
+        if getattr(self, "_active_timeout_request", None) is request:
+            self._active_timeout_request = None
+        request.resolve(bool(reset))
+        if not reset:
+            for pending in getattr(self, "_pending_timeout_requests", []):
+                pending.resolve(False)
+            self._pending_timeout_requests = []
+            return
+        QTimer.singleShot(0, self._show_next_pendant_timeout)
 
     def _on_pendant_alarm_go(self, alarm_no, name):
         message = f"'{name}' 입력 타임아웃 후 다음 스텝을 진행합니다."

@@ -7,14 +7,14 @@ import os
 import json
 from datetime import datetime
 
-from PySide6.QtCore import (Qt, QObject, Signal, Slot, Property, QUrl,
+from PySide6.QtCore import (Qt, QObject, Signal, Slot, Property,
                             QAbstractListModel, QModelIndex, QByteArray)
-from PySide6.QtGui import QColor
-from PySide6.QtWidgets import QVBoxLayout, QWidget
-from PySide6.QtQuickWidgets import QQuickWidget
 
 from utils.paths import get_recipes_dir
 from utils.json_utils import save_json
+from ui.pages.page_auto_qml import (
+    default_auto_info_config, normalize_auto_info_config,
+)
 try:
     from utils.mode_manager import ModeManager
 except ImportError:
@@ -100,13 +100,15 @@ class DataBackend(QObject):
          self._p._on_save_clicked, self._p._on_del_clicked)[idx]()
 
 
-class PageDataQml(QWidget):
+class PageDataQml(QObject):
     sig_file_loaded = Signal(str)
 
     def __init__(self, sequence_data=None, position_points=None,
                  timer_library=None, mode_data=None, view_order_data=None,
-                 speed_state=None, packing_config=None):
+                 speed_state=None, packing_config=None, overlay=None,
+                 variable_store=None, auto_info_config=None):
         super().__init__()
+        self.qml_overlay = overlay
         self.sequence_data = sequence_data if sequence_data is not None else {}
         if "Main" not in self.sequence_data:
             self.sequence_data["Main"] = []
@@ -116,6 +118,11 @@ class PageDataQml(QWidget):
         self.view_order_data = view_order_data if view_order_data is not None else []
         self.speed_state = speed_state if speed_state is not None else {"speed_level": 10}
         self.packing_config = packing_config if packing_config is not None else {}
+        self.variable_store = variable_store
+        self.auto_info_config = (
+            auto_info_config if auto_info_config is not None
+            else default_auto_info_config()
+        )
 
         self.save_dir = get_recipes_dir()
         self.current_filename = None
@@ -131,19 +138,6 @@ class PageDataQml(QWidget):
         self._file_model = StrListModel(self)
         self._prev_model = StrListModel(self)
         self._be = DataBackend(self)
-
-        self._view = QQuickWidget(self)
-        self._view.setResizeMode(QQuickWidget.SizeRootObjectToView)
-        self._view.setClearColor(QColor("#16202B"))
-        ctx = self._view.rootContext()
-        ctx.setContextProperty("fileModel", self._file_model)
-        ctx.setContextProperty("previewModel", self._prev_model)
-        ctx.setContextProperty("dataBackend", self._be)
-        self._view.setSource(QUrl.fromLocalFile(_QML_PATH))
-
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.addWidget(self._view)
 
         self._refresh_file_list()
         self.update_language()
@@ -169,9 +163,11 @@ class PageDataQml(QWidget):
                                else "파일을 선택하면 상세 정보가 표시됩니다.")
         self._be.changed.emit()
 
-    def showEvent(self, event):
+    def activate(self):
         self._refresh_file_list()
-        super().showEvent(event)
+
+    def deactivate(self):
+        pass
 
     # ---- 리스트 (QListWidget → model) ----
     def _refresh_file_list(self):
@@ -224,7 +220,7 @@ class PageDataQml(QWidget):
             date_str = dt.strftime('%Y-%m-%d %H:%M')
             self._info_text = f" {filename[:-5]}   |   {info_extra}   |   🕒 {date_str}"
             lines = []
-            icons = {"POS": "[P]", "OUT": "[Y]", "IN": "[X]",
+            icons = {"POS": "[P]", "WPOS": "[WP]", "OUT": "[Y]", "IN": "[X]",
                      "TMR": "[T]", "JMP": "[J]", "CALL": "[C]"}
             if steps:
                 step_num = 0
@@ -266,6 +262,10 @@ class PageDataQml(QWidget):
             "view_order": self.view_order_data,
             "speed_level": int(self.speed_state.get("speed_level", 10)),
             "packing_config": self.packing_config,
+            "variable_library": (
+                self.variable_store.to_dict() if self.variable_store else {}
+            ),
+            "auto_info_config": normalize_auto_info_config(self.auto_info_config),
             "user_modes": ModeManager.instance().to_dict() if ModeManager else {}
         }
         lm = LanguageManager.instance() if LanguageManager else None
@@ -283,12 +283,12 @@ class PageDataQml(QWidget):
                 self.sig_file_loaded.emit(display_name)
                 t_done = lm.get_text("title_done") if lm else "완료"
                 m_done = lm.get_text("msg_save_done") if lm else "저장되었습니다."
-                self.window().qml_overlay.show_message(t_done, m_done)
+                self.qml_overlay.show_message(t_done, m_done)
             else:
                 print(f"[AutoSave] Saved {display_name}.json")
         except Exception as e:
             if not is_auto:
-                self.window().qml_overlay.show_message("Error", f"Save Failed:\n{e}", error=True)
+                self.qml_overlay.show_message("Error", f"Save Failed:\n{e}", error=True)
             else:
                 print(f"[AutoSave] Error: {e}")
 
@@ -301,7 +301,7 @@ class PageDataQml(QWidget):
         t_msg = lm.get_text("msg_new_confirm") if lm else "데이터를 새로 만듭니다."
         def confirmed(ok):
             if not ok: return
-            self.window().qml_overlay.request_text("새 파일 이름 입력", callback=named)
+            self.qml_overlay.request_text("새 파일 이름 입력", callback=named)
         def named(ok, name):
             if not ok or not name: return
             safe_name = "".join(c for c in name if c.isalnum() or c in (' ', '_', '-', '.')).strip()
@@ -310,7 +310,7 @@ class PageDataQml(QWidget):
             if os.path.exists(filepath):
                 title = lm.get_text("title_dup") if lm else "중복 확인"
                 body = (lm.get_text("msg_dup_confirm").format(safe_name) if lm else f"'{safe_name}' 중복. 덮어쓸까요?")
-                self.window().qml_overlay.request_confirm(
+                self.qml_overlay.request_confirm(
                     title, body, callback=lambda accepted: finalize(filepath, safe_name) if accepted else None,
                 )
             else:
@@ -321,14 +321,14 @@ class PageDataQml(QWidget):
                     "type": "POS", "name": "원점 복귀", "point_name": "원점",
                     "active_axes": [True] * 8, "speeds": [100] * 8}]
             self._perform_save(filepath, safe_name)
-        self.window().qml_overlay.request_confirm(t_title, t_msg, callback=confirmed)
+        self.qml_overlay.request_confirm(t_title, t_msg, callback=confirmed)
 
     def _on_save_clicked(self):
         lm = LanguageManager.instance() if LanguageManager else None
         if not self.current_filename or self.current_filename == "No Data":
             t_not = lm.get_text("title_notice") if lm else "알림"
             m_not = lm.get_text("msg_no_save_target") if lm else "저장할 대상이 없습니다."
-            self.window().qml_overlay.show_message(t_not, m_not)
+            self.qml_overlay.show_message(t_not, m_not)
             return
         t_sav = lm.get_text("title_save") if lm else "저장 확인"
         m_sav = (lm.get_text("msg_save_confirm").format(self.current_filename)
@@ -337,7 +337,7 @@ class PageDataQml(QWidget):
             if not accepted: return
             filepath = os.path.join(self.save_dir, f"{self.current_filename}.json")
             self._perform_save(filepath, self.current_filename)
-        self.window().qml_overlay.request_confirm(t_sav, m_sav, callback=finished)
+        self.qml_overlay.request_confirm(t_sav, m_sav, callback=finished)
 
     def _on_load_clicked(self):
         cur = self._cur_item()
@@ -345,14 +345,14 @@ class PageDataQml(QWidget):
         if not cur:
             t_not = lm.get_text("title_notice") if lm else "알림"
             m_not = lm.get_text("msg_no_sel_load") if lm else "파일을 선택해주세요."
-            self.window().qml_overlay.show_message(t_not, m_not)
+            self.qml_overlay.show_message(t_not, m_not)
             return
         filename, disp = cur
         filepath = os.path.join(self.save_dir, filename)
         t_load = lm.get_text("title_load") if lm else "불러오기 확인"
         m_load = (lm.get_text("msg_load_confirm").format(disp) if lm
                   else f"'{disp}' 로드?")
-        self.window().qml_overlay.request_confirm(
+        self.qml_overlay.request_confirm(
             t_load, m_load,
             callback=lambda accepted: self._perform_load(filepath, disp, lm) if accepted else None,
         )
@@ -372,6 +372,11 @@ class PageDataQml(QWidget):
                     self.sequence_data.update(seq_raw)
             if "Main" not in self.sequence_data:
                 self.sequence_data["Main"] = []
+            if self.variable_store:
+                self.variable_store.load_from_dict(
+                    new_data.get("variable_library", {}) if isinstance(new_data, dict) else {},
+                    self.sequence_data,
+                )
             self.position_points.clear()
             self.position_points.update(new_data.get("position_points", {}))
             self.timer_library.clear()
@@ -391,6 +396,10 @@ class PageDataQml(QWidget):
             pc = new_data.get("packing_config", {})
             if isinstance(pc, dict):
                 self.packing_config.update(pc)
+            self.auto_info_config[:] = normalize_auto_info_config(
+                new_data.get("auto_info_config")
+                if isinstance(new_data, dict) else None,
+            )
             self.current_filename = disp
             self.sig_file_loaded.emit(disp)
             if isinstance(new_data, dict):
@@ -399,9 +408,9 @@ class PageDataQml(QWidget):
                     ModeManager.instance().load_from_dict(user_modes)
             t_done = lm.get_text("title_done") if lm else "완료"
             m_done = lm.get_text("msg_load_done") if lm else "로드 완료."
-            self.window().qml_overlay.show_message(t_done, m_done)
+            self.qml_overlay.show_message(t_done, m_done)
         except Exception as e:
-            self.window().qml_overlay.show_message("Error", f"Load Failed:\n{e}", error=True)
+            self.qml_overlay.show_message("Error", f"Load Failed:\n{e}", error=True)
 
     def _on_del_clicked(self):
         cur = self._cur_item()
@@ -409,7 +418,7 @@ class PageDataQml(QWidget):
         if not cur:
             t_not = lm.get_text("title_notice") if lm else "알림"
             m_not = lm.get_text("msg_no_sel_del") if lm else "선택해주세요."
-            self.window().qml_overlay.show_message(t_not, m_not)
+            self.qml_overlay.show_message(t_not, m_not)
             return
         filename, deleted_name = cur
         filepath = os.path.join(self.save_dir, filename)
@@ -426,5 +435,5 @@ class PageDataQml(QWidget):
                     self.current_filename = None
                 self._be.changed.emit()
             except Exception as e:
-                self.window().qml_overlay.show_message("Error", f"Delete Failed:\n{e}", error=True)
-        self.window().qml_overlay.request_confirm(t_del, m_del, callback=finished)
+                self.qml_overlay.show_message("Error", f"Delete Failed:\n{e}", error=True)
+        self.qml_overlay.request_confirm(t_del, m_del, callback=finished)

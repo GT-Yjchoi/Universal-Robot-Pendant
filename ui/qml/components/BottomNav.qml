@@ -1,12 +1,14 @@
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 
-Rectangle {
+Item {
     id: root
+    objectName: "bottomBarSurface"
     property int currentIndex: 0
     property var labels: ["수동","자동","모드","위치","타이머","패킹","데이터","설정"]
     signal selected(int index)
-    color:"#18212c"; radius:10; border.color:"#344353"; implicitHeight:70
+    implicitHeight:70
+
     Row { anchors.fill:parent; anchors.margins:8; spacing:8
         Repeater { model:root.labels
             PendantButton {

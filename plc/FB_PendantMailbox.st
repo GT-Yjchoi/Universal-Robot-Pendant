@@ -2,8 +2,9 @@
   Panasonic FP0H - single pendant hardware command executor.
   Recipe steps, TMR, JMP, CALL, DAT and internal bits remain on Raspberry Pi.
 
-  Bind request/status variables to DT300..DT354 in FPWIN global variables.
-  Bind w_SystemOutput/w_ValveOutput to the application's physical output words.
+  Bind request variables to DT300..DT342 and status variables to DT400..DT404
+  in FPWIN global variables.
+  Bind aw_OutputRequest[0..3] to DT210..DT213 (configured output slots 1..4).
   The existing servo driver consumes the motion request interface below.
 *)
 FUNCTION_BLOCK FB_PendantMailbox
@@ -18,16 +19,13 @@ VAR_INPUT
     w_MotionFlags      : WORD;
     adi_Target         : ARRAY[0..7] OF DINT;
     aw_Speed           : ARRAY[0..7] OF WORD;
-    w_Acceleration     : WORD;
-    w_Deceleration     : WORD;
     b_InterlockOK      : BOOL;
     b_MotionDone       : BOOL;
     b_MotionError      : BOOL;
     w_MotionErrorCode  : WORD;
 END_VAR
 VAR_IN_OUT
-    w_SystemOutput     : WORD;
-    w_ValveOutput      : WORD;
+    aw_OutputRequest   : ARRAY[0..3] OF WORD;
 END_VAR
 VAR_OUTPUT
     w_AckSeq           : WORD;
@@ -42,8 +40,6 @@ VAR_OUTPUT
     w_MoveAxisMask     : WORD;
     aw_MoveSpeed       : ARRAY[0..7] OF WORD;
     adi_MoveTarget     : ARRAY[0..7] OF DINT;
-    w_MoveAcceleration : WORD;
-    w_MoveDeceleration : WORD;
 END_VAR
 VAR
     i                   : INT;
@@ -54,6 +50,7 @@ VAR
     b_PulseActive       : BOOL;
     w_PulseGroup        : WORD;
     w_PulseMask         : WORD;
+    b_InterlockPrev     : BOOL;
 END_VAR
 
 b_MoveRequest := FALSE;
@@ -63,12 +60,28 @@ b_ResetRequest := FALSE;
 
 (* PLC-timed pulse completion *)
 fb_Pulse(IN := b_PulseActive, PT := DINT_TO_TIME(di_DurationMs));
-IF b_PulseActive AND fb_Pulse.Q THEN
-    IF w_PulseGroup = 0 THEN
-        w_SystemOutput := w_SystemOutput AND NOT w_PulseMask;
-    ELSE
-        w_ValveOutput := w_ValveOutput AND NOT w_PulseMask;
+
+(* Interlock has priority over every normal command. A falling edge also
+   requests a stop for a simultaneous-transition move that was already ACKed. *)
+IF NOT b_InterlockOK THEN
+    IF b_InterlockPrev OR (w_State = 1) THEN
+        b_StopRequest := TRUE;
     END_IF;
+    b_PulseActive := FALSE;
+    FOR i := 0 TO 3 DO
+        aw_OutputRequest[i] := 0;
+    END_FOR;
+    IF w_State = 1 THEN
+        w_Error := 1;
+        w_State := 3;
+        w_AckSeq := w_ActiveSeq;
+    END_IF;
+END_IF;
+b_InterlockPrev := b_InterlockOK;
+
+IF b_PulseActive AND fb_Pulse.Q THEN
+    aw_OutputRequest[WORD_TO_INT(w_PulseGroup)] :=
+        aw_OutputRequest[WORD_TO_INT(w_PulseGroup)] AND NOT w_PulseMask;
     b_PulseActive := FALSE;
     w_State := 2;
     w_AckSeq := w_ActiveSeq;
@@ -78,8 +91,9 @@ END_IF;
 IF (w_RequestSeq <> w_AckSeq) AND (w_Command = 12) THEN
     b_StopRequest := TRUE;
     b_PulseActive := FALSE;
-    w_SystemOutput := 0;
-    w_ValveOutput := 0;
+    FOR i := 0 TO 3 DO
+        aw_OutputRequest[i] := 0;
+    END_FOR;
     w_EchoCommand := w_Command;
     w_Error := 0;
     w_State := 2;
@@ -101,35 +115,39 @@ ELSIF (w_RequestSeq <> w_AckSeq) AND (w_State <> 1) THEN
             1: (* output set *)
                 IF w_Index > 15 THEN
                     w_Error := 2; w_State := 3;
+                ELSIF w_Group > 3 THEN
+                    w_Error := 3; w_State := 3;
                 ELSE
                     w_Mask := SHL(WORD#1, WORD_TO_INT(w_Index));
-                    IF w_Group = 0 THEN
-                        IF w_Value <> 0 THEN w_SystemOutput := w_SystemOutput OR w_Mask;
-                        ELSE w_SystemOutput := w_SystemOutput AND NOT w_Mask; END_IF;
-                    ELSIF w_Group = 1 THEN
-                        IF w_Value <> 0 THEN w_ValveOutput := w_ValveOutput OR w_Mask;
-                        ELSE w_ValveOutput := w_ValveOutput AND NOT w_Mask; END_IF;
+                    IF w_Value <> 0 THEN
+                        aw_OutputRequest[WORD_TO_INT(w_Group)] :=
+                            aw_OutputRequest[WORD_TO_INT(w_Group)] OR w_Mask;
                     ELSE
-                        w_Error := 3; w_State := 3;
+                        aw_OutputRequest[WORD_TO_INT(w_Group)] :=
+                            aw_OutputRequest[WORD_TO_INT(w_Group)] AND NOT w_Mask;
                     END_IF;
-                    IF w_Error = 0 THEN w_State := 2; END_IF;
+                    w_State := 2;
                 END_IF;
                 w_AckSeq := w_RequestSeq;
 
             2: (* PLC-timed positive pulse *)
-                IF (w_Index > 15) OR (di_DurationMs <= 0) THEN
+                IF w_Group > 3 THEN
+                    w_Error := 3; w_State := 3; w_AckSeq := w_RequestSeq;
+                ELSIF (w_Index > 15) OR (di_DurationMs <= 0) THEN
                     w_Error := 4; w_State := 3; w_AckSeq := w_RequestSeq;
                 ELSE
                     w_PulseMask := SHL(WORD#1, WORD_TO_INT(w_Index));
                     w_PulseGroup := w_Group;
-                    IF w_Group = 0 THEN w_SystemOutput := w_SystemOutput OR w_PulseMask;
-                    ELSIF w_Group = 1 THEN w_ValveOutput := w_ValveOutput OR w_PulseMask;
-                    ELSE w_Error := 3; w_State := 3; w_AckSeq := w_RequestSeq; END_IF;
-                    IF w_Error = 0 THEN b_PulseActive := TRUE; w_State := 1; END_IF;
+                    aw_OutputRequest[WORD_TO_INT(w_Group)] :=
+                        aw_OutputRequest[WORD_TO_INT(w_Group)] OR w_PulseMask;
+                    b_PulseActive := TRUE;
+                    w_State := 1;
                 END_IF;
 
             3: (* all outputs off *)
-                w_SystemOutput := 0; w_ValveOutput := 0;
+                FOR i := 0 TO 3 DO
+                    aw_OutputRequest[i] := 0;
+                END_FOR;
                 b_PulseActive := FALSE; w_State := 2; w_AckSeq := w_RequestSeq;
 
             10: (* absolute servo move *)
@@ -138,8 +156,6 @@ ELSIF (w_RequestSeq <> w_AckSeq) AND (w_State <> 1) THEN
                     aw_MoveSpeed[i] := aw_Speed[i];
                 END_FOR;
                 w_MoveAxisMask := w_AxisMask;
-                w_MoveAcceleration := w_Acceleration;
-                w_MoveDeceleration := w_Deceleration;
                 b_MoveRequest := TRUE;
                 (* motion flag bit0: acknowledge after command acceptance so the
                    pendant can execute the next step while motion continues. *)

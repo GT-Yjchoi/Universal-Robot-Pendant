@@ -7,8 +7,18 @@ import QtQuick.Controls
 
 Rectangle {
     id: root
+    required property var axisModel
+    required property var previewModel
+    required property var valveModel
+    required property var valveBackend
+    required property var posBackend
     color: "#660F161E"; radius: 16
     border.color: "#23FFFFFF"; border.width: 1
+
+    SequenceMonitorPopup {
+        id: sequenceMonitorPopup
+        posBackend: root.posBackend
+    }
 
     RowLayout {
         anchors.fill: parent
@@ -160,6 +170,26 @@ Rectangle {
                 spacing: 10
                 Text { text: "동작 순서"; color: "#E9EEF3"
                        font.pixelSize: 18; font.bold: true }
+                Rectangle {
+                    Layout.preferredWidth: 108
+                    Layout.preferredHeight: 40
+                    radius: 6
+                    color: editSequenceMa.pressed ? "#2D69C4" : "#315D86"
+                    border.color: "#65A1FF"
+                    border.width: 1
+                    Text {
+                        anchors.centerIn: parent
+                        text: "동작 편집"
+                        color: "white"
+                        font.pixelSize: 15
+                        font.bold: true
+                    }
+                    MouseArea {
+                        id: editSequenceMa
+                        anchors.fill: parent
+                        onClicked: if (posBackend) posBackend.openSeqEditor()
+                    }
+                }
                 Item { Layout.fillWidth: true }
                 ComboBox {
                     id: seqCombo
@@ -245,14 +275,11 @@ Rectangle {
                         }
                         Rectangle { anchors.bottom: parent.bottom; width: parent.width
                                     height: 1; color: "#0DFFFFFF" }
-                        MouseArea { anchors.fill: parent
-                            onClicked: if (posBackend) posBackend.openSeqEditor() }
-                    }
-                    // 빈 시퀀스 클릭도 편집기 열기
-                    MouseArea {
-                        anchors.fill: parent
-                        enabled: prev.count === 0
-                        onClicked: if (posBackend) posBackend.openSeqEditor()
+                        MouseArea {
+                            anchors.fill: parent
+                            preventStealing: false
+                            onClicked: sequenceMonitorPopup.open()
+                        }
                     }
                 }
             }

@@ -18,3 +18,7 @@ venv/
 # Runtime logs (운영 중 쌓이는 로그 — 저장소 비대화 방지)
 alarm_history.json
 op_history.json
+
+# Local UI verification captures
+/dat-step-detail.png
+/pendant-live-screenshot.png

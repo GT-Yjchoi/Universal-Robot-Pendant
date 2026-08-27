@@ -318,14 +318,14 @@ class ValvePanel(QScrollArea):  # [변경] QWidget -> QScrollArea 상속
         if not self.isVisible():
             return  # 숨겨진 페이지는 버튼 동기화 불필요
         outputs = data.get('outputs', [])
-        if not outputs or len(outputs) < 2:
+        if not outputs or len(outputs) < 3:
             return
         self._sync_toggle_buttons(outputs)
 
     def _sync_toggle_buttons(self, outputs):
-        """outputs (DT120=Y00~Y0F, DT121=Y20~Y2F) 로 토글 버튼 checked 상태 갱신.
-        bit_index 0~15  → outputs[0] (DT120) bit 0~15
-        bit_index 16~31 → outputs[1] (DT121) bit 0~15
+        """outputs (DT144=Y00~Y0F, DT146=Y20~Y2F) 로 토글 버튼 checked 상태 갱신.
+        bit_index 0~15  → outputs[0] (DT144) bit 0~15
+        bit_index 16~31 → outputs[2] (DT146) bit 0~15
         모멘터리 버튼은 건드리지 않음 (사용자가 누르고 있는 중일 수 있음).
         """
         for btn in self.valve_buttons:
@@ -337,7 +337,7 @@ class ValvePanel(QScrollArea):  # [변경] QWidget -> QScrollArea 상속
             if bit_index < 16:
                 word_idx, bit_pos = 0, bit_index
             else:
-                word_idx, bit_pos = 1, bit_index - 16
+                word_idx, bit_pos = 2, bit_index - 16
             if word_idx >= len(outputs):
                 continue
             is_on = bool(outputs[word_idx] & (1 << bit_pos))

@@ -6,6 +6,11 @@ import QtQuick.Layouts
 
 Rectangle {
     id: root
+    required property var axisModel
+    required property var ioInModel
+    required property var ioOutModel
+    required property var ioBackend
+    required property var autoBackend
     color: "#660F161E"; radius: 16
     border.color: "#23FFFFFF"; border.width: 1
 
@@ -13,6 +18,11 @@ Rectangle {
     property var ss: autoBackend ? autoBackend.subStates : []
     property int spd: autoBackend ? autoBackend.speedLevel : 10
     property string spdCol: autoBackend ? autoBackend.speedColor : "#2ECC71"
+
+    AutoInfoEditPopup {
+        id: infoEditPopup
+        autoBackend: root.autoBackend
+    }
 
     RowLayout {
         anchors.fill: parent
@@ -114,11 +124,13 @@ Rectangle {
                 }
             }
 
-            // 원점복귀 (자동운전 버튼 행 바로 아래). 누르면 확인 →
-            // DT164=1. DT165==1 이면 라벨이 '원점복귀완료'(초록).
+            // 원점복귀 (자동운전 버튼 행 바로 아래). 명령은 DT300 메일박스로
+            // 전달하고, DT117의 활성축 원점완료 비트가 모두 켜지면 초록색 표시.
             Rectangle {
+                visible: autoBackend ? autoBackend.homeVisible : true
                 Layout.fillWidth: true; Layout.fillHeight: false
-                Layout.preferredHeight: 56; Layout.maximumHeight: 56
+                Layout.preferredHeight: visible ? 56 : 0
+                Layout.maximumHeight: visible ? 56 : 0
                 radius: 12
                 property bool hdone: autoBackend ? autoBackend.homeDone : false
                 property bool hblk: autoBackend ? autoBackend.homeBlocked : false
@@ -146,7 +158,8 @@ Rectangle {
                         Layout.fillWidth: true; Layout.preferredHeight: 50; radius: 8
                         property var st: root.ss[index]
                         color: st ? st.bg : "#34495E"
-                        border.width: 1; border.color: "#555555"
+                        border.width: st && st.bw !== undefined ? st.bw : 1
+                        border.color: st && st.bd !== undefined ? st.bd : "#555555"
                         Text { anchors.centerIn: parent; text: index === 0 ? "START" : "PAUSE"
                                color: st ? st.fg : "#BBBBBB"; font.pixelSize: 16; font.bold: true }
                         MouseArea { anchors.fill: parent
@@ -158,7 +171,7 @@ Rectangle {
             Item { Layout.fillHeight: true }
 
             Rectangle {
-                Layout.fillWidth: true; Layout.preferredHeight: 150
+                Layout.fillWidth: true; Layout.preferredHeight: 180
                 color: "#0DFFFFFF"; radius: 10
                 border.color: "#444444"; border.width: 1
                 ColumnLayout {
@@ -211,25 +224,82 @@ Rectangle {
                 }
             }
 
-            Item { Layout.fillHeight: true }
-
             Rectangle {
-                Layout.fillWidth: true; Layout.preferredHeight: 150
-                color: "transparent"; radius: 12
+                Layout.fillWidth: true; Layout.fillHeight: true
+                Layout.preferredHeight: Math.min(
+                    260, 75 + (autoBackend ? autoBackend.infoCount : 4) * 30
+                )
+                Layout.minimumHeight: 160
+                Layout.maximumHeight: 260
+                color: "#0DFFFFFF"; radius: 12; clip: true
                 border.color: "#33FFFFFF"; border.width: 1
                 ColumnLayout {
-                    anchors.fill: parent; anchors.margins: 18; spacing: 10
-                    Text { text: autoBackend ? autoBackend.infoTitle : ""
-                           color: "#DDDDDD"; font.pixelSize: 16; font.bold: true }
+                    anchors.fill: parent; anchors.margins: 15; spacing: 7
+                    RowLayout {
+                        Layout.fillWidth: true; Layout.preferredHeight: 22
+                        Text {
+                            Layout.fillWidth: true
+                            text: (autoBackend ? autoBackend.infoTitle : "") + "  ·  길게 눌러 설정"
+                            color: "#DDDDDD"; font.pixelSize: 16; font.bold: true
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        Rectangle {
+                            Layout.preferredWidth: 34; Layout.preferredHeight: 28
+                            radius: 6
+                            visible: autoBackend && autoBackend.canAddInfo
+                            color: addInfoMa.pressed ? "#315F91" : "#294B6D"
+                            border.color: "#65A1FF"
+                            Text { anchors.centerIn: parent; text: "+"; color: "white"
+                                   font.pixelSize: 21; font.bold: true }
+                            MouseArea {
+                                id: addInfoMa
+                                anchors.fill: parent
+                                onClicked: {
+                                    if (autoBackend && autoBackend.addInfo())
+                                        infoEditPopup.open()
+                                }
+                            }
+                        }
+                    }
+                    Text {
+                        Layout.fillWidth: true; Layout.fillHeight: true
+                        visible: autoBackend && autoBackend.infoCount === 0
+                        text: "+ 버튼으로 운전정보를 추가하세요."
+                        color: "#718394"; font.pixelSize: 14
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
                     Repeater {
                         model: autoBackend ? autoBackend.infoRows : []
-                        delegate: RowLayout {
-                            Layout.fillWidth: true
-                            Text { text: modelData.name; color: "#CCCCCC"
-                                   font.pixelSize: 16; font.bold: true }
-                            Item { Layout.fillWidth: true }
-                            Text { text: modelData.val; color: "white"
-                                   font.pixelSize: 18; font.bold: true }
+                        delegate: Item {
+                            Layout.fillWidth: true; Layout.preferredHeight: 24
+                            RowLayout {
+                                anchors.fill: parent
+                                spacing: 8
+                                Text {
+                                    Layout.fillWidth: true
+                                    text: modelData.name; color: "#CCCCCC"
+                                    font.pixelSize: 15; font.bold: true
+                                    elide: Text.ElideRight
+                                    verticalAlignment: Text.AlignVCenter
+                                }
+                                Text {
+                                    Layout.preferredWidth: 112
+                                    text: modelData.val; color: "white"
+                                    font.pixelSize: 18; font.bold: true
+                                    horizontalAlignment: Text.AlignRight
+                                    verticalAlignment: Text.AlignVCenter
+                                }
+                            }
+                            MouseArea {
+                                anchors.fill: parent
+                                onPressAndHold: {
+                                    if (!autoBackend)
+                                        return
+                                    autoBackend.beginInfoEdit(index)
+                                    infoEditPopup.open()
+                                }
+                            }
                         }
                     }
                     Item { Layout.fillHeight: true }

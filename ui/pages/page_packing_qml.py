@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import os
 
-from PySide6.QtCore import QObject, Property, QTimer, Signal, Slot, QUrl
-from PySide6.QtQuickWidgets import QQuickWidget
-from PySide6.QtWidgets import QVBoxLayout, QWidget
+from PySide6.QtCore import QObject, Property, QTimer, Signal, Slot
 
 
 _QML_PATH = os.path.join(os.path.dirname(__file__), "PagePacking.qml")
@@ -25,7 +23,10 @@ class PackingBackend(QObject):
     def __init__(self, owner):
         super().__init__(owner)
         self._owner = owner
-        self._current = [1, 1, 1]
+        indices = list(owner.packing_config.get("current_indices", (0, 0, 0)))[:3]
+        while len(indices) < 3:
+            indices.append(0)
+        self._current = [max(0, int(value)) + 1 for value in indices]
         self._anim = [0, 0, 0]
         self._sim_state = 1
         self._playing = True
@@ -123,9 +124,16 @@ class PackingBackend(QObject):
             return
         count = int(self._cfg().get(f"{axis}_count", 1))
         value = max(1, min(count, int(one_based)))
-        plc = self._owner.plc_client
-        if plc and plc.is_connected:
-            plc.submit(plc.write_pack_idx, axis, value - 1)
+        axis_index = ("x", "y", "z").index(axis)
+        indices = list(self._cfg().get("current_indices", (0, 0, 0)))[:3]
+        while len(indices) < 3:
+            indices.append(0)
+        indices[axis_index] = value - 1
+        self._cfg()["current_indices"] = indices
+        self._current[axis_index] = value
+        self.changed.emit()
+        self.configChanged.emit()
+        self._owner.sig_packing_changed.emit()
 
     @Slot()
     def toggleSimulation(self):
@@ -144,7 +152,7 @@ class PackingBackend(QObject):
         self._anim = [0, 0, 0]
         self._sim_state = 1
         self._playing = True
-        if self._owner.isVisible():
+        if self._owner._active:
             self._owner._sim_timer.start()
         self.animationChanged.emit()
 
@@ -172,23 +180,27 @@ class PackingBackend(QObject):
             self._owner._sim_timer.stop()
         self.animationChanged.emit()
 
-    def update_monitor(self, data):
-        values = list(data.get("pack_idx", (0, 0, 0)))[:3]
-        current = [int(v) + 1 for v in values]
+    def update_current(self):
+        values = list(self._cfg().get("current_indices", (0, 0, 0)))[:3]
+        while len(values) < 3:
+            values.append(0)
+        current = [max(0, int(v)) + 1 for v in values]
         if current != self._current:
             self._current = current
             self.changed.emit()
 
 
-class PagePackingQml(QWidget):
+class PagePackingQml(QObject):
     sig_packing_changed = Signal()
 
-    def __init__(self, position_points=None, sequence_data=None, plc_client=None, packing_config=None):
+    def __init__(self, position_points=None, sequence_data=None, plc_client=None,
+                 packing_config=None, overlay=None):
         super().__init__()
         self.position_points = position_points if position_points is not None else {}
         self.sequence_data = sequence_data if sequence_data is not None else {}
         self.plc_client = plc_client
-        self._pending_monitor = None
+        self.qml_overlay = overlay
+        self._active = False
         self.packing_config = packing_config if packing_config is not None else {}
         self._apply_defaults()
         self._backend = PackingBackend(self)
@@ -196,28 +208,13 @@ class PagePackingQml(QWidget):
         self._sim_timer.setInterval(500)
         self._sim_timer.timeout.connect(self._backend.advance)
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        self._view = QQuickWidget(self)
-        self._view.setResizeMode(QQuickWidget.SizeRootObjectToView)
-        self._view.rootContext().setContextProperty("packingBackend", self._backend)
-        self._view.setSource(QUrl.fromLocalFile(_QML_PATH))
-        layout.addWidget(self._view)
-        if plc_client:
-            plc_client.sig_monitor_data.connect(self._on_monitor_data)
-
-    def _on_monitor_data(self, data):
-        if not self.isVisible():
-            self._pending_monitor = dict(data)
-            return
-        self._backend.update_monitor(data)
-
     def _apply_defaults(self):
         defaults = {
             "x_count": 5, "x_pitch": 10.0, "x_dir": 1,
             "y_count": 4, "y_pitch": 10.0, "y_dir": 1,
             "z_count": 3, "z_pitch": 10.0, "z_dir": -1,
             "stack_order": 0, "enabled": False,
+            "current_indices": [0, 0, 0],
         }
         for key, value in defaults.items():
             self.packing_config.setdefault(key, value)
@@ -231,19 +228,18 @@ class PagePackingQml(QWidget):
 
     def refresh_ui(self):
         self._apply_defaults()
+        self._backend.update_current()
         self._backend.refresh()
         self._backend.resetSimulation()
 
     def update_language(self, lang_code=None):
         self._backend.refresh()
 
-    def showEvent(self, event):
+    def activate(self):
+        self._active = True
+        self._backend.update_current()
         self._backend.resetSimulation()
-        super().showEvent(event)
-        if self._pending_monitor is not None:
-            data, self._pending_monitor = self._pending_monitor, None
-            self._backend.update_monitor(data)
 
-    def hideEvent(self, event):
+    def deactivate(self):
+        self._active = False
         self._sim_timer.stop()
-        super().hideEvent(event)

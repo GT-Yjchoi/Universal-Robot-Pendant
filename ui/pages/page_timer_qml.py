@@ -6,11 +6,8 @@ reorder 로직은 PageTimer 와 동일. 다이얼로그 재사용.
 import os
 import time
 
-from PySide6.QtCore import (Qt, QObject, Signal, Slot, Property, QUrl, QTimer,
+from PySide6.QtCore import (Qt, QObject, Signal, Slot, Property, QTimer,
                             QAbstractListModel, QModelIndex, QByteArray)
-from PySide6.QtGui import QColor
-from PySide6.QtWidgets import QVBoxLayout, QWidget
-from PySide6.QtQuickWidgets import QQuickWidget
 
 _QML_PATH = os.path.join(os.path.dirname(__file__), "PageTimer.qml")
 _R_NAME = Qt.UserRole + 1
@@ -42,7 +39,7 @@ class TimerModel(QAbstractListModel):
 
     def rebuild(self):
         self.beginResetModel()
-        self._names = list(self._lib.keys())
+        self._names = sorted(str(name) for name in self._lib)
         self.endResetModel()
 
     def update_one(self, name):
@@ -76,15 +73,16 @@ class TimerBackend(QObject):
     def reorder(self):
         self._p._on_reorder_clicked()
 
-
-class PageTimerQml(QWidget):
+class PageTimerQml(QObject):
     sig_timer_changed = Signal()
 
     def __init__(self, sequence_data=None, timer_library=None, plc_client=None,
-                 local_runtime=None):
+                 local_runtime=None, overlay=None):
         super().__init__()
         self.plc_client = plc_client
         self.local_runtime = local_runtime
+        self.qml_overlay = overlay
+        self._active = False
         self.sequence_data = sequence_data if sequence_data is not None else {}
         self.timer_library = timer_library if timer_library is not None else {}
 
@@ -106,18 +104,6 @@ class PageTimerQml(QWidget):
         self._model = TimerModel(self.timer_library, self)
         self._be = TimerBackend(self)
 
-        self._view = QQuickWidget(self)
-        self._view.setResizeMode(QQuickWidget.SizeRootObjectToView)
-        self._view.setClearColor(QColor("#16202B"))
-        ctx = self._view.rootContext()
-        ctx.setContextProperty("timerModel", self._model)
-        ctx.setContextProperty("timerBackend", self._be)
-        self._view.setSource(QUrl.fromLocalFile(_QML_PATH))
-
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.addWidget(self._view)
-
         if self.plc_client:
             self.plc_client.sig_monitor_data.connect(self._on_monitor_data)
         if self.local_runtime:
@@ -127,13 +113,17 @@ class PageTimerQml(QWidget):
     # ---- 호환 ----
     def refresh_grid(self):
         self._model.rebuild()
+        self._be.changed.emit()
 
-    def showEvent(self, event):
-        super().showEvent(event)
+    def activate(self):
+        self._active = True
         QTimer.singleShot(0, self.refresh_grid)
         if self._pending_monitor is not None:
             data, self._pending_monitor = self._pending_monitor, None
             QTimer.singleShot(0, lambda d=data: self._on_monitor_data(d))
+
+    def deactivate(self):
+        self._active = False
 
     # ---- 편집 (PageTimer._on_card_clicked) ----
     def _on_card_clicked(self, name):
@@ -151,7 +141,7 @@ class PageTimerQml(QWidget):
                 op_record("TIMER", f"타이머 '{name}' {old_sec:.2f}s → {new_sec:.2f}s")
             except Exception:
                 pass
-        self.window().qml_overlay.request_number(
+        self.qml_overlay.request_number(
             f"타이머: {name}", time_sec, decimal=True, minimum=0, maximum=99999,
             callback=finished,
         )
@@ -171,6 +161,12 @@ class PageTimerQml(QWidget):
                 elif step.get("type") == "OUT" and step.get("delay_timer_ref") == timer_name:
                     step["delay_time"] = new_sec
                     patch_count += 1
+                elif step.get("type") == "IN" and step.get("timeout_timer_ref") == timer_name:
+                    step["timeout"] = new_sec
+                    patch_count += 1
+                elif step.get("type") == "IN" and step.get("timeup_timer_ref") == timer_name:
+                    step["timeup_time"] = new_sec
+                    patch_count += 1
         if patch_count:
             print(f"[Timer Library] Synced {patch_count} pendant step(s) referencing '{timer_name}'")
         self.sig_timer_changed.emit()
@@ -183,7 +179,7 @@ class PageTimerQml(QWidget):
             reordered = {n: self.timer_library[n] for n in new_order if n in self.timer_library}
             self.timer_library.clear(); self.timer_library.update(reordered)
             self.refresh_grid(); self.sig_timer_changed.emit()
-        self.window().qml_overlay.request_reorder(
+        self.qml_overlay.request_reorder(
             "타이머 순서 변경", list(self.timer_library.keys()), callback=finished,
         )
 
@@ -191,7 +187,7 @@ class PageTimerQml(QWidget):
     def _on_monitor_data(self, data):
         if not isinstance(data, dict):
             return
-        if not self.isVisible():
+        if not self._active:
             self._pending_monitor = dict(data)
             if self._blink_timer.isActive():
                 self._blink_timer.stop()

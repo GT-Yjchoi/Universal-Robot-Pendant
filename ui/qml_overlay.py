@@ -2,14 +2,9 @@
 
 from __future__ import annotations
 
-import os
 import json
-import threading
-import queue
 
-from PySide6.QtCore import QObject, Property, Qt, Signal, Slot, QUrl
-from PySide6.QtGui import QColor
-from PySide6.QtQuickWidgets import QQuickWidget
+from PySide6.QtCore import QObject, Property, Signal, Slot
 from utils.paths import get_settings_path
 
 
@@ -109,8 +104,8 @@ class OverlayBackend(QObject):
     def setJogValve(self, index, active): self._owner._set_jog_valve(index, active)
 
 
-class QmlOverlayLayer(QQuickWidget):
-    """Transparent top-level child; callbacks run after QML popup completion."""
+class QmlOverlayLayer(QObject):
+    """Non-visual popup/alarm/JOG controller for the single QML scene."""
 
     def __init__(self, parent):
         super().__init__(parent)
@@ -129,30 +124,19 @@ class QmlOverlayLayer(QQuickWidget):
         self._jog_speed = 1
         self._jog_valves = []
         self._plc = getattr(parent, "plc_client", None)
-        self._command_queue = queue.Queue()
-        self._command_worker = threading.Thread(
-            target=self._command_loop, name="qml-control-queue", daemon=True
-        )
-        self._command_worker.start()
         self._backend = OverlayBackend(self)
-        self.setResizeMode(QQuickWidget.SizeRootObjectToView)
-        self.setClearColor(QColor(Qt.transparent))
-        self.setAttribute(Qt.WA_AlwaysStackOnTop, True)
-        self.setAttribute(Qt.WA_TranslucentBackground, True)
-        self.rootContext().setContextProperty("overlayBackend", self._backend)
-        path = os.path.join(os.path.dirname(__file__), "qml", "OverlayHost.qml")
-        self.setSource(QUrl.fromLocalFile(path))
-        self.hide()
         if self._plc is not None:
             self._plc.sig_monitor_data.connect(self._update_jog_monitor)
+
+    @property
+    def backend(self):
+        return self._backend
 
     def request_number(self, title, value=0, *, decimal=False, signed=False,
                        minimum=-999999999, maximum=999999999, password=False,
                        callback=None):
         self._number_callback = callback
         self._popup_active = True
-        self.resize(self.parentWidget().size())
-        self.show(); self.raise_()
         self._backend.numberRequested.emit(
             str(title), float(value), bool(decimal), bool(signed),
             float(minimum), float(maximum), bool(password),
@@ -161,39 +145,31 @@ class QmlOverlayLayer(QQuickWidget):
     def show_message(self, title, message, *, error=False, callback=None):
         self._message_callback = callback
         self._popup_active = True
-        self.resize(self.parentWidget().size())
-        self.show(); self.raise_()
         self._backend.messageRequested.emit(str(title), str(message), bool(error))
 
     def request_confirm(self, title, message, *, accept_text="확인", reject_text="취소", callback=None):
         self._confirm_callback = callback
         self._popup_active = True
-        self.resize(self.parentWidget().size())
-        self.show(); self.raise_()
         self._backend.confirmRequested.emit(str(title), str(message), str(accept_text), str(reject_text))
 
     def request_reorder(self, title, values, *, callback=None):
         self._reorder_callback = callback
         self._popup_active = True
-        self.resize(self.parentWidget().size()); self.show(); self.raise_()
         self._backend.reorderRequested.emit(str(title), list(values))
 
     def request_text(self, title, value="", *, password=False, callback=None):
         self._text_callback = callback
         self._popup_active = True
-        self.resize(self.parentWidget().size()); self.show(); self.raise_()
         self._backend.textRequested.emit(str(title), str(value), bool(password))
 
     def request_selection(self, title, values, current=-1, *, callback=None):
         self._select_callback = callback
         self._popup_active = True
-        self.resize(self.parentWidget().size()); self.show(); self.raise_()
         self._backend.selectRequested.emit(str(title), list(values), int(current))
 
     def request_fine_adjust(self, title, value, minimum, maximum, *, callback=None):
         self._fine_callback = callback
         self._popup_active = True
-        self.resize(self.parentWidget().size()); self.show(); self.raise_()
         self._backend.fineRequested.emit(str(title), float(value), float(minimum), float(maximum))
 
     def show_history(self):
@@ -216,7 +192,6 @@ class QmlOverlayLayer(QQuickWidget):
             row["categoryLabel"] = op_labels.get(row.get("category", ""), row.get("category", ""))
             operations.append(row)
         self._popup_active = True
-        self.resize(self.parentWidget().size()); self.show(); self.raise_()
         self._backend.historyRequested.emit(alarms, operations)
 
     def _number_done(self, accepted, value):
@@ -267,10 +242,9 @@ class QmlOverlayLayer(QQuickWidget):
         self._sync_visible()
 
     def _sync_visible(self):
-        if self._popup_active or self.has_any_alarm() or self._jog_visible:
-            self.resize(self.parentWidget().size()); self.show(); self.raise_()
-        else:
-            self.hide()
+        # OverlayHost always exists in the single QML scene. Individual QML
+        # controls bind to backend state and therefore need no QWidget layer.
+        pass
 
     def _alarm_value(self, key, default=None):
         if not self._alarm_order: return default
@@ -310,12 +284,12 @@ class QmlOverlayLayer(QQuickWidget):
     def hide_estop(self): self.remove_alarm("estop")
 
     def show_user_alarm(self, alarm_no):
-        from ui.overlays.alarm_overlay import USER_ALARMS
+        from ui.alarm_catalog import USER_ALARMS
         self.add_alarm("user_alarm", "[!] USER ALARM [!]", f"A-{alarm_no:03d}: {USER_ALARMS.get(alarm_no, f'사용자 알람 #{alarm_no}')}" )
     def hide_user_alarm(self): self.remove_alarm("user_alarm")
 
     def show_step_alarm(self, alarm_id):
-        from ui.overlays.alarm_overlay import STEP_ALARM_DESCRIPTIONS
+        from ui.alarm_catalog import STEP_ALARM_DESCRIPTIONS
         desc = STEP_ALARM_DESCRIPTIONS.get(alarm_id, f"정의되지 않은 에러 (ID={alarm_id})")
         self.add_alarm("step_alarm", "[!] STEP ALARM [!]", f"E-{alarm_id:02d}: {desc}")
     def hide_step_alarm(self): self.remove_alarm("step_alarm")
@@ -333,24 +307,21 @@ class QmlOverlayLayer(QQuickWidget):
         if self._alarm_order: self.remove_alarm(self._alarm_order[self._alarm_index])
 
     def _submit(self, func, *args):
-        self._command_queue.put((func, args))
-
-    def _command_loop(self):
-        while True:
-            func, args = self._command_queue.get()
-            self._safe_call(func, args)
-            self._command_queue.task_done()
-
-    @staticmethod
-    def _safe_call(func, args):
-        try: func(*args)
-        except Exception as exc: print(f"[QML control backend] {exc}")
+        if self._plc is not None:
+            self._plc.submit(func, *args, priority=0)
 
     def _load_jog_valves(self):
         try:
             with open(get_settings_path(), "r", encoding="utf-8") as stream:
                 configs = json.load(stream).get("valve_config", [])
-            rows = [c for c in configs if c.get("jog_valve", False)]
+            try:
+                from utils.io_manager import IOManager
+                point_count = IOManager.instance().point_count(False)
+            except Exception:
+                point_count = 32
+            rows = [c for c in configs
+                    if c.get("jog_valve", False)
+                    and 0 <= int(c.get("index", -1)) < point_count]
             rows.sort(key=lambda c: c.get("jog_order", 99))
             return [{"name": c.get("name", "밸브"), "index": int(c.get("index", 0)),
                      "mode": c.get("mode", "toggle"), "on": False} for c in rows[:10]]
@@ -375,7 +346,7 @@ class QmlOverlayLayer(QQuickWidget):
         bits = {"X +":0,"X -":1,"Y +":2,"Y -":3,"Z +":4,"Z -":5,"A +":6,"A -":7}
         bit = bits.get(name)
         if bit is not None and self._plc and self._plc.is_connected:
-            self._submit(self._plc.write_bit, 0x09, self._plc.ADDR_JOG_CTRL, bit, bool(active))
+            self._submit(self._plc.write_axis_jog_bit, bit, bool(active))
 
     def _set_jog_speed(self, speed):
         speed = max(1, min(5, int(speed)))
@@ -387,7 +358,7 @@ class QmlOverlayLayer(QQuickWidget):
     def _set_jog_valve(self, index, active):
         if not self._plc or not self._plc.is_connected: return
         bit_index = int(index)
-        address = 203 if bit_index < 16 else 204
+        address = self._plc.ADDR_OUTPUT_BASE + bit_index // 16
         self._submit(self._plc.write_bit, 0x09, address, bit_index % 16, bool(active))
 
     @Slot(dict)
@@ -397,7 +368,8 @@ class QmlOverlayLayer(QQuickWidget):
         changed = False
         rows = []
         for row in self._jog_valves:
-            item = dict(row); index = item["index"]; word, bit = divmod(index, 16)
+            item = dict(row); index = item["index"]
+            word, bit = divmod(index, 16)
             on = word < len(outputs) and bool(int(outputs[word]) & (1 << bit))
             if item["on"] != on: changed = True
             item["on"] = on; rows.append(item)

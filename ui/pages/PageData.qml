@@ -4,6 +4,9 @@ import QtQuick.Layouts
 
 Rectangle {
     id: root
+    required property var fileModel
+    required property var previewModel
+    required property var dataBackend
     color: "#660F161E"; radius: 16
     border.color: "#23FFFFFF"; border.width: 1
 

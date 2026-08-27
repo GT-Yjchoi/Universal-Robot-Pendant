@@ -7,10 +7,18 @@ import QtQuick.Controls
 
 Rectangle {
     id: root
+    required property var ioModel
+    required property var paramModel
+    required property var valveModel
+    required property var alarmModel
+    required property var wifiModel
+    required property var ilModeModel
+    required property var ilGroupModel
+    required property var settingsBackend
     color: "#660F161E"; radius: 16
     border.color: "#23FFFFFF"; border.width: 1
 
-    readonly property var tabNames: ["일반 설정","IO 이름 변경","시스템 파라미터",
+    readonly property var tabNames: ["일반 설정","IO설정","시스템 파라미터",
         "밸브 설정","알람 메시지","인터록 설정","네트워크"]
 
     ColumnLayout {
@@ -272,18 +280,92 @@ Rectangle {
                 }
             }
 
-            // ---------- [1] IO 이름 변경 ----------
+            // ---------- [1] IO 설정 ----------
             Item {
                 ColumnLayout {
                     anchors.fill: parent; anchors.margins: 10; spacing: 8
                     Text { Layout.alignment: Qt.AlignRight
-                           text: "※ 변경 후 [이름 적용] 버튼을 눌러야 저장됩니다."
+                           text: "※ 변경 후 [IO 설정 적용] 버튼을 눌러야 저장됩니다."
                            color: "#80FFFFFF"; font.pixelSize: 13 }
+                    RowLayout {
+                        Layout.fillWidth: true; Layout.preferredHeight: 42; spacing: 8
+                        Text { text: "입력 그룹"; color: "#64FFDA"; font.pixelSize: 14; font.bold: true
+                               Layout.preferredWidth: 74 }
+                        Repeater {
+                            model: settingsBackend ? settingsBackend.inputGroupLabels : []
+                            delegate: Rectangle {
+                                Layout.preferredWidth: 164; Layout.preferredHeight: 38
+                                radius: 7; color: inGroupEdit.pressed ? "#284B63" : "#183544"
+                                border.color: "#39758B"; border.width: 1
+                                Text { anchors.left: parent.left; anchors.leftMargin: 10
+                                       anchors.right: inGroupDelete.left; anchors.rightMargin: 4
+                                       anchors.verticalCenter: parent.verticalCenter
+                                       text: modelData; color: "white"; font.pixelSize: 12; font.bold: true
+                                       elide: Text.ElideRight }
+                                MouseArea { id: inGroupEdit; anchors.fill: parent; anchors.rightMargin: 34
+                                    onClicked: settingsBackend.editIoGroup(true, index) }
+                                Rectangle {
+                                    id: inGroupDelete; anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
+                                    anchors.rightMargin: 5; width: 28; height: 28; radius: 5
+                                    color: inDeleteMa.pressed ? "#A93226" : "#613036"
+                                    Text { anchors.centerIn: parent; text: "×"; color: "#FFB3B3"; font.pixelSize: 18 }
+                                    MouseArea { id: inDeleteMa; anchors.fill: parent
+                                        onClicked: settingsBackend.removeIoGroup(true, index) }
+                                }
+                            }
+                        }
+                        Rectangle {
+                            visible: settingsBackend ? settingsBackend.canAddInputGroup : false
+                            Layout.preferredWidth: 40; Layout.preferredHeight: 38; radius: 7
+                            color: inAddMa.pressed ? "#246B58" : "#174D41"; border.color: "#35A98B"
+                            Text { anchors.centerIn: parent; text: "+"; color: "#64FFDA"; font.pixelSize: 24 }
+                            MouseArea { id: inAddMa; anchors.fill: parent
+                                onClicked: settingsBackend.addIoGroup(true) }
+                        }
+                        Item { Layout.fillWidth: true }
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true; Layout.preferredHeight: 42; spacing: 8
+                        Text { text: "출력 그룹"; color: "#FFD280"; font.pixelSize: 14; font.bold: true
+                               Layout.preferredWidth: 74 }
+                        Repeater {
+                            model: settingsBackend ? settingsBackend.outputGroupLabels : []
+                            delegate: Rectangle {
+                                Layout.preferredWidth: 164; Layout.preferredHeight: 38
+                                radius: 7; color: outGroupEdit.pressed ? "#5A4924" : "#3E321B"
+                                border.color: "#8D7135"; border.width: 1
+                                Text { anchors.left: parent.left; anchors.leftMargin: 10
+                                       anchors.right: outGroupDelete.left; anchors.rightMargin: 4
+                                       anchors.verticalCenter: parent.verticalCenter
+                                       text: modelData; color: "white"; font.pixelSize: 12; font.bold: true
+                                       elide: Text.ElideRight }
+                                MouseArea { id: outGroupEdit; anchors.fill: parent; anchors.rightMargin: 34
+                                    onClicked: settingsBackend.editIoGroup(false, index) }
+                                Rectangle {
+                                    id: outGroupDelete; anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
+                                    anchors.rightMargin: 5; width: 28; height: 28; radius: 5
+                                    color: outDeleteMa.pressed ? "#A93226" : "#613036"
+                                    Text { anchors.centerIn: parent; text: "×"; color: "#FFB3B3"; font.pixelSize: 18 }
+                                    MouseArea { id: outDeleteMa; anchors.fill: parent
+                                        onClicked: settingsBackend.removeIoGroup(false, index) }
+                                }
+                            }
+                        }
+                        Rectangle {
+                            visible: settingsBackend ? settingsBackend.canAddOutputGroup : false
+                            Layout.preferredWidth: 40; Layout.preferredHeight: 38; radius: 7
+                            color: outAddMa.pressed ? "#735D25" : "#51431F"; border.color: "#A88738"
+                            Text { anchors.centerIn: parent; text: "+"; color: "#FFD280"; font.pixelSize: 24 }
+                            MouseArea { id: outAddMa; anchors.fill: parent
+                                onClicked: settingsBackend.addIoGroup(false) }
+                        }
+                        Item { Layout.fillWidth: true }
+                    }
                     RowLayout {
                         Layout.fillWidth: true; spacing: 0
                         Text { text: "  입력 (Input) 이름"; color: "#AAAAAA"
                                font.pixelSize: 13; font.bold: true; Layout.fillWidth: true }
-                        Text { text: "  출력 (Output) 이름"; color: "#AAAAAA"
+                        Text { text: "  출력 (Output) 이름 / 자동정지 동작"; color: "#AAAAAA"
                                font.pixelSize: 13; font.bold: true; Layout.fillWidth: true }
                     }
                     Rectangle {
@@ -297,11 +379,12 @@ Rectangle {
                             delegate: RowLayout {
                                 width: ListView.view ? ListView.view.width : 0
                                 height: 44; spacing: 8
-                                Text { text: model.xaddr; color: "#64FFDA"
+                                Text { visible: model.inhas; text: model.xaddr; color: "#64FFDA"
                                        font.pixelSize: 15; font.bold: true
                                        Layout.preferredWidth: 44
                                        horizontalAlignment: Text.AlignHCenter }
                                 Rectangle {
+                                    visible: model.inhas
                                     Layout.fillWidth: true; Layout.preferredHeight: 38
                                     radius: 6; color: inMa.pressed ? "#33468CFF" : "#1AFFFFFF"
                                     border.color: "#33FFFFFF"; border.width: 1
@@ -311,24 +394,50 @@ Rectangle {
                                            font.pixelSize: 14; elide: Text.ElideRight }
                                     MouseArea { id: inMa; anchors.fill: parent
                                         onClicked: if (settingsBackend)
-                                            settingsBackend.editInName(index) }
+                                            settingsBackend.editInName(model.inindex) }
                                 }
-                                Text { text: model.yaddr; color: "#FFD280"
+                                Item { visible: !model.inhas; Layout.preferredWidth: 44 }
+                                Item { visible: !model.inhas; Layout.fillWidth: true; Layout.preferredHeight: 38 }
+                                Text { visible: model.outhas; text: model.yaddr; color: "#FFD280"
                                        font.pixelSize: 15; font.bold: true
                                        Layout.preferredWidth: 44
                                        horizontalAlignment: Text.AlignHCenter }
                                 Rectangle {
+                                    visible: model.outhas
                                     Layout.fillWidth: true; Layout.preferredHeight: 38
                                     radius: 6; color: ouMa.pressed ? "#33468CFF" : "#1AFFFFFF"
                                     border.color: "#33FFFFFF"; border.width: 1
-                                    Text { anchors.fill: parent; anchors.leftMargin: 10
+                                    Text { anchors.left: parent.left; anchors.right: outModeButton.left
+                                           anchors.top: parent.top; anchors.bottom: parent.bottom
+                                           anchors.leftMargin: 10; anchors.rightMargin: 6
                                            verticalAlignment: Text.AlignVCenter
                                            text: model.outname; color: "white"
                                            font.pixelSize: 14; elide: Text.ElideRight }
-                                    MouseArea { id: ouMa; anchors.fill: parent
+                                    MouseArea { id: ouMa; anchors.fill: parent; anchors.rightMargin: 82
                                         onClicked: if (settingsBackend)
-                                            settingsBackend.editOutName(index) }
+                                            settingsBackend.editOutName(model.outindex) }
+                                    Rectangle {
+                                        id: outModeButton
+                                        anchors.right: parent.right; anchors.rightMargin: 3
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        width: 76; height: 32; radius: 5
+                                        color: model.outmode === "LATCH"
+                                               ? (outModeMa.pressed ? "#146E64" : "#18594F")
+                                               : (outModeMa.pressed ? "#9B3B35" : "#71332F")
+                                        border.width: 1
+                                        border.color: model.outmode === "LATCH" ? "#45D6C2" : "#E06B62"
+                                        Text {
+                                            anchors.centerIn: parent
+                                            text: model.outmode
+                                            color: "white"; font.pixelSize: 12; font.bold: true
+                                        }
+                                        MouseArea { id: outModeMa; anchors.fill: parent
+                                            onClicked: if (settingsBackend)
+                                                settingsBackend.toggleOutputStopMode(model.outindex) }
+                                    }
                                 }
+                                Item { visible: !model.outhas; Layout.preferredWidth: 44 }
+                                Item { visible: !model.outhas; Layout.fillWidth: true; Layout.preferredHeight: 38 }
                             }
                         }
                     }
@@ -336,7 +445,7 @@ Rectangle {
                         Layout.fillWidth: true; Layout.preferredHeight: 50
                         Layout.fillHeight: false; radius: 10
                         color: ioSaveMa.pressed ? "#2A65C7" : "#468CFF"
-                        Text { anchors.centerIn: parent; text: "이름 적용"
+                        Text { anchors.centerIn: parent; text: "IO 설정 적용"
                                color: "white"; font.pixelSize: 16; font.bold: true }
                         MouseArea { id: ioSaveMa; anchors.fill: parent
                             onClicked: if (settingsBackend) settingsBackend.applyIoNames() }
@@ -377,7 +486,7 @@ Rectangle {
                                 RowLayout {
                                     Layout.fillWidth: true; spacing: 8
                                     Repeater {
-                                        model: ["축","사용","방향","스트로크","가감속","PPR"]
+                                        model: ["축","사용","엔코더","방향","스트로크","가감속","PPR"]
                                         delegate: Text { text: modelData; color: "#BBBBBB"
                                             font.pixelSize: 12; font.bold: true
                                             Layout.fillWidth: true
@@ -408,6 +517,23 @@ Rectangle {
                                                 MouseArea { anchors.fill: parent
                                                     onClicked: if (settingsBackend)
                                                         settingsBackend.toggleAxisUse(index) } } }
+                                        // 엔코더 분류 (앱 설정 — PLC 파라미터 주소를 사용하지 않음)
+                                        Item { Layout.fillWidth: true
+                                            Layout.preferredWidth: 1; height: 36
+                                            Rectangle { anchors.centerIn: parent
+                                                width: 100; height: 30; radius: 4
+                                                property bool absolute:
+                                                    model.axencoder === "absolute"
+                                                color: absolute ? "#332E86C1" : "#33AF601A"
+                                                border.color: absolute ? "#5DADE2" : "#F5B041"
+                                                border.width: 1
+                                                Text { anchors.centerIn: parent
+                                                    text: parent.absolute ? "앱솔루트" : "인크리멘탈"
+                                                    color: parent.absolute ? "#85C1E9" : "#F8C471"
+                                                    font.pixelSize: 11; font.bold: true }
+                                                MouseArea { anchors.fill: parent
+                                                    onClicked: if (settingsBackend)
+                                                        settingsBackend.toggleAxisEncoder(index) } } }
                                         // 방향
                                         Item { Layout.fillWidth: true
                                             Layout.preferredWidth: 1; height: 36

@@ -7,8 +7,14 @@ from typing import Mapping, Protocol
 
 
 class SignalGroup(IntEnum):
-    SYSTEM_IO = 0
-    VALVE_IO = 1
+    IO_GROUP_1 = 0
+    IO_GROUP_2 = 1
+    IO_GROUP_3 = 4
+    IO_GROUP_4 = 5
+
+    # Backward-compatible names used by older recipes/tests.
+    SYSTEM_IO = IO_GROUP_1
+    VALVE_IO = IO_GROUP_2
 
 
 class ControlBackend(Protocol):
@@ -21,4 +27,3 @@ class ControlBackend(Protocol):
     def all_outputs_off(self) -> None: ...
     def snapshot(self) -> tuple[int, int]: ...
     def close(self) -> None: ...
-

@@ -3,19 +3,15 @@
 
 - UI/스크롤: PageManual.qml (Qt Quick = GPU 씬그래프, 키네틱 스크롤)
 - 로직 전부 Python. **밸브 작동(PLC R-M-W)은 ValvePanel 에서 한 글자도
-  안 바꾸고 복사** — DT203/204 주소·비트연산·read/write 시퀀스 동일.
-  (모니터 동기화는 outputs DT120/121 으로 — 원본 비대칭 그대로 보존)
+  출력 요청은 DT210~213, 실제 출력 모니터는 DT144~147을 사용한다.
 
 main_window: PageManual(plc_client=...) 와 생성자/메서드 호환.
 """
 import json
 import os
 
-from PySide6.QtCore import (Qt, QObject, Signal, Slot, Property, QUrl, QTimer,
+from PySide6.QtCore import (Qt, QObject, Signal, Slot, Property, QTimer,
                             QAbstractListModel, QModelIndex, QByteArray)
-from PySide6.QtGui import QColor
-from PySide6.QtWidgets import QVBoxLayout, QWidget
-from PySide6.QtQuickWidgets import QQuickWidget
 
 from utils.paths import get_settings_path
 
@@ -109,6 +105,12 @@ class IoModel(QAbstractListModel):
             self._labels[i] = text
             self.dataChanged.emit(self.index(i, 0), self.index(i, 0),
                                   [self.R_LABEL])
+
+    def reset_labels(self, labels):
+        self.beginResetModel()
+        self._labels = list(labels)
+        self._on = [False] * len(self._labels)
+        self.endResetModel()
 
     def update_from_words(self, words):
         # IOList.update_from_words 와 동일 로직 (변경 비트만)
@@ -235,10 +237,26 @@ class ValveBackend(QObject):
                 with open(path, 'r', encoding='utf-8') as f:
                     settings = json.load(f)
                     valve_config = settings.get("valve_config", [])
-            if not valve_config or len(valve_config) != 32:
-                valve_config = self._get_default_valve_config()
+            defaults = self._get_default_valve_config()
+            by_index = {int(c.get("index", i)): dict(c)
+                        for i, c in enumerate(defaults)}
+            if isinstance(valve_config, list):
+                for i, config in enumerate(valve_config):
+                    if not isinstance(config, dict):
+                        continue
+                    index = int(config.get("index", i))
+                    if index in by_index:
+                        by_index[index].update(config)
+                        by_index[index]["index"] = index
+            valve_config = list(by_index.values())
             valve_config.sort(key=lambda x: x.get("order", 0))
-            enabled_valves = [v for v in valve_config if v.get("enabled", True)]
+            point_count = (IOManager.instance().point_count(False)
+                           if IOManager else 32)
+            enabled_valves = [
+                v for v in valve_config
+                if 0 <= int(v.get("index", -1)) < point_count
+                and v.get("enabled", True)
+            ]
             self.valve_configs = enabled_valves
             self._model.reset_configs(enabled_valves)
             print(f"[ValvePanel] {len(enabled_valves)}개 밸브 버튼 생성 완료")
@@ -260,21 +278,25 @@ class ValveBackend(QObject):
             "포스쳐 반전", "포스쳐 복귀", "스위블 회전", "스위블 복귀",
             "니퍼 컷팅 1", "니퍼 컷팅 2", "컨베이어 출력", "공급기 출력"
         ]
+        point_count = (IOManager.instance().point_count(False)
+                       if IOManager else 32)
         config = []
-        for i in range(32):
-            name = named_y2x[i - 16] if i >= 16 else named_y0x[i]
+        for i in range(point_count):
+            if IOManager:
+                name = IOManager.instance().get_output_name(i)
+            else:
+                name = named_y2x[i - 16] if 16 <= i < 32 else (
+                    named_y0x[i] if i < 16 else f"출력 {i + 1}"
+                )
             config.append({
                 "index": i, "name": name, "mode": "toggle",
-                "enabled": i >= 16, "order": i
+                "enabled": 16 <= i < 32, "order": i
             })
         return config
 
     # ----- 아래 4개는 ValvePanel 원본과 동일 (UI 의존 없음) -----
     def _valve_dt_addr(self, bit_index):
-        if bit_index < 16:
-            return 203, bit_index
-        else:
-            return 204, bit_index - 16
+        return self.plc_client.ADDR_OUTPUT_BASE + int(bit_index) // 16, int(bit_index) % 16
 
     def _log_valve_op(self, bit_index, state):
         try:
@@ -294,7 +316,10 @@ class ValveBackend(QObject):
         if self._locked:
             return
         if self.plc_client and self.plc_client.is_connected:
-            self.plc_client.submit(self._write_valve_state, bit_index, bool(checked), True)
+            self.plc_client.submit(
+                self._write_valve_state, bit_index, bool(checked), True,
+                priority=1,
+            )
         # 낙관적 표시 (실제 상태는 다음 monitor sync 가 확정)
         self._model.set_checked_by_bit(bit_index, checked)
 
@@ -303,14 +328,18 @@ class ValveBackend(QObject):
         if self._locked:
             return
         if self.plc_client and self.plc_client.is_connected:
-            self.plc_client.submit(self._write_valve_state, bit_index, True, True)
+            self.plc_client.submit(
+                self._write_valve_state, bit_index, True, True, priority=1,
+            )
 
     @Slot(int)
     def valveReleased(self, bit_index):
         if self._locked:
             return
         if self.plc_client and self.plc_client.is_connected:
-            self.plc_client.submit(self._write_valve_state, bit_index, False, False)
+            self.plc_client.submit(
+                self._write_valve_state, bit_index, False, False, priority=1,
+            )
 
     def _write_valve_state(self, bit_index, enabled, log_operation):
         dt_addr, bit_pos = self._valve_dt_addr(bit_index)
@@ -320,17 +349,14 @@ class ValveBackend(QObject):
             self._log_valve_op(bit_index, "ON" if enabled else "OFF")
 
     def sync_from_outputs(self, outputs):
-        # ValvePanel._sync_toggle_buttons 와 동일 (DT120/121 비대칭 보존)
+        # Non-compressed map: DT144=Y00, DT145=Y10, DT146=Y20, DT147=Y30.
         for c in self.valve_configs:
             if c.get("mode") != "toggle":
                 continue
             bit_index = c.get("index")
             if bit_index is None:
                 continue
-            if bit_index < 16:
-                word_idx, bit_pos = 0, bit_index
-            else:
-                word_idx, bit_pos = 1, bit_index - 16
+            word_idx, bit_pos = divmod(int(bit_index), 16)
             if word_idx >= len(outputs):
                 continue
             is_on = bool(outputs[word_idx] & (1 << bit_pos))
@@ -338,14 +364,23 @@ class ValveBackend(QObject):
 
 
 # ───────────────────────── 페이지 ─────────────────────────
-class PageManualQml(QWidget):
-    def __init__(self, plc_client=None):
+class PageManualQml(QObject):
+    def __init__(self, plc_client=None, overlay=None):
         super().__init__()
         self.plc_client = plc_client
+        self.qml_overlay = overlay
+        self._active = False
 
         self._axis = AxisModel(self)
-        self._io_in = IoModel([f"X{v:02X}" for v in range(0x00, 0x20)], self)
-        self._io_out = IoModel([f"Y{v:02X}" for v in range(0x00, 0x20)], self)
+        mgr = IOManager.instance() if IOManager else None
+        self._io_in = IoModel(
+            [mgr.display_label(True, i) for i in range(mgr.point_count(True))]
+            if mgr else [f"X{v:02X}" for v in range(0x00, 0x20)], self,
+        )
+        self._io_out = IoModel(
+            [mgr.display_label(False, i) for i in range(mgr.point_count(False))]
+            if mgr else [f"Y{v:02X}" for v in range(0x00, 0x20)], self,
+        )
         self._valve_m = ValveModel(self)
         self._io_be = IoBackend(self)
         self._valve_be = ValveBackend(plc_client, self._valve_m, self)
@@ -353,22 +388,6 @@ class PageManualQml(QWidget):
         self._valve_be.load_configs()
         self._last_cfg_mtime = self._cfg_mtime()
         self._apply_io_names()
-
-        self._view = QQuickWidget(self)
-        self._view.setResizeMode(QQuickWidget.SizeRootObjectToView)
-        self._view.setClearColor(QColor("#16202B"))
-        ctx = self._view.rootContext()
-        ctx.setContextProperty("axisModel", self._axis)
-        ctx.setContextProperty("ioInModel", self._io_in)
-        ctx.setContextProperty("ioOutModel", self._io_out)
-        ctx.setContextProperty("valveModel", self._valve_m)
-        ctx.setContextProperty("ioBackend", self._io_be)
-        ctx.setContextProperty("valveBackend", self._valve_be)
-        self._view.setSource(QUrl.fromLocalFile(_QML_PATH))
-
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.addWidget(self._view)
 
         if self.plc_client:
             self.plc_client.sig_monitor_data.connect(self._on_monitor_data)
@@ -384,9 +403,12 @@ class PageManualQml(QWidget):
         if not IOManager:
             return
         mgr = IOManager.instance()
-        for i in range(32):
-            self._io_in.set_label(i, mgr.get_input_name(i))
-            self._io_out.set_label(i, mgr.get_output_name(i))
+        self._io_in.reset_labels([
+            mgr.display_label(True, i) for i in range(mgr.point_count(True))
+        ])
+        self._io_out.reset_labels([
+            mgr.display_label(False, i) for i in range(mgr.point_count(False))
+        ])
 
     # ---- 실시간 monitor ----
     def _on_monitor_data(self, data):
@@ -396,7 +418,7 @@ class PageManualQml(QWidget):
         op_status = data.get('op_status', 0)
         self._valve_be.set_locked(op_status in (1, 2))
 
-        if not self.isVisible():
+        if not self._active:
             return
         if 'axis_pos' in data:
             self._axis.set_values(data['axis_pos'])
@@ -425,8 +447,8 @@ class PageManualQml(QWidget):
         except OSError:
             return 0
 
-    def showEvent(self, event):
-        super().showEvent(event)
+    def activate(self):
+        self._active = True
         m = self._cfg_mtime()
         if m > self._last_cfg_mtime:
             print("[ValvePanel] 설정 파일 변경 감지! 자동 새로고침...")
@@ -434,6 +456,9 @@ class PageManualQml(QWidget):
             self._apply_io_names()
             self._last_cfg_mtime = m
         QTimer.singleShot(0, self._refresh_axis_visibility)
+
+    def deactivate(self):
+        self._active = False
 
     # ---- main_window 호환 ----
     def update_language(self, lang_code=None):

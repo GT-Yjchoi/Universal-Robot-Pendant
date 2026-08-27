@@ -60,6 +60,11 @@ class FastechI8O8Backend:
                 raise first_error
             raise
 
+    def reset_outputs(self, indices) -> None:
+        mask = sum(1 << int(index) for index in indices if 0 <= int(index) < 8)
+        if mask:
+            self.client.set_output(reset_mask=mask << 8)
+
     def close(self) -> None:
         self.client.close()
 

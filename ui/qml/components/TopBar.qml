@@ -1,8 +1,9 @@
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 
-Rectangle {
+Item {
     id: root
+    objectName: "topBarSurface"
     property bool connected: false
     property string recipeName: "No Data"
     property string modeText: "모드: 정지"
@@ -10,20 +11,17 @@ Rectangle {
     property string alarmText: ""
     signal jogRequested()
     signal alarmRequested()
-    color: "#18212c"
-    radius: 10
-    border.color: "#344353"
-    implicitHeight: 68
+    implicitHeight: 60
 
     Row {
         id: companyBlock
         anchors.left: parent.left
         anchors.leftMargin: 16
         anchors.verticalCenter: parent.verticalCenter
-        spacing: 7
+        spacing: 14
 
         Image {
-            source: "../../../gtlogo.png"
+            source: "../../../gtlogo-transparent.png"
             width: 38
             height: 34
             fillMode: Image.PreserveAspectFit
@@ -32,12 +30,34 @@ Rectangle {
         }
 
         Text {
+            id: clock
             anchors.verticalCenter: parent.verticalCenter
-            text: "AUTOMATION"
-            color: "#f0f4f8"
-            font.pixelSize: 21
+            color: "#dce5ee"
+            font.pixelSize: 19
             font.bold: true
-            font.letterSpacing: 1
+
+            function update() {
+                var now = new Date()
+                var hour = now.getHours()
+                var marker = hour < 12 ? "AM" : "PM"
+                var hour12 = hour % 12
+                if (hour12 === 0)
+                    hour12 = 12
+                var hourText = hour12 < 10 ? "0" + hour12 : "" + hour12
+                var minute = now.getMinutes()
+                var minuteText = minute < 10 ? "0" + minute : "" + minute
+                text = Qt.formatDateTime(now, "yyyy/MM/dd")
+                       + "  " + marker + " " + hourText + ":" + minuteText
+            }
+
+            Component.onCompleted: update()
+
+            Timer {
+                interval: 1000
+                running: true
+                repeat: true
+                onTriggered: clock.update()
+            }
         }
     }
 
@@ -63,7 +83,7 @@ Rectangle {
                 anchors.verticalCenter: parent.verticalCenter
                 text: root.connected ? "PLC 연결" : "PLC 끊김"
                 color: root.connected ? "#72f29a" : "#ff7777"
-                font.pixelSize: 15
+                font.pixelSize: 18
                 font.bold: true
             }
         }
@@ -79,7 +99,7 @@ Rectangle {
             anchors.verticalCenter: parent.verticalCenter
             text: root.modeText
             color: root.modeColor
-            font.pixelSize: 16
+            font.pixelSize: 19
             font.bold: true
         }
 
@@ -94,7 +114,7 @@ Rectangle {
             anchors.verticalCenter: parent.verticalCenter
             text: "레시피: " + root.recipeName
             color: "#ffd280"
-            font.pixelSize: 16
+            font.pixelSize: 19
             font.bold: true
         }
     }
@@ -105,27 +125,6 @@ Rectangle {
         anchors.rightMargin: 12
         anchors.verticalCenter: parent.verticalCenter
         spacing: 10
-
-        Text {
-            id: clock
-            anchors.verticalCenter: parent.verticalCenter
-            color: "#dce5ee"
-            font.pixelSize: 16
-            font.bold: true
-
-            function update() {
-                text = Qt.formatDateTime(new Date(), "yyyy/MM/dd  HH:mm")
-            }
-
-            Component.onCompleted: update()
-
-            Timer {
-                interval: 1000
-                running: true
-                repeat: true
-                onTriggered: clock.update()
-            }
-        }
 
         PendantButton {
             width: 82

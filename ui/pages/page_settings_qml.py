@@ -16,19 +16,14 @@ WiFi/이더넷 작업은 Python 워커에서 처리하고 모든 시각 팝업�
 import json
 import os
 
-from PySide6.QtCore import (Qt, QObject, Signal, Slot, Property, QUrl, QTimer,
-                            QAbstractListModel, QModelIndex, QByteArray)
-from PySide6.QtGui import QColor
-from PySide6.QtWidgets import QVBoxLayout, QWidget, QApplication
-from PySide6.QtQuickWidgets import QQuickWidget
+from PySide6.QtCore import (Qt, QObject, Signal, Slot, Property, QTimer,
+                            QAbstractListModel, QModelIndex, QByteArray, QThread)
+from PySide6.QtGui import QGuiApplication
 
 from utils.paths import get_settings_path as _get_settings_path
 from utils.json_utils import load_json, save_json
 from utils import backlight
 
-# 네트워크 상태 워커는 Python 백엔드에 유지한다. 시각 팝업은 모두 QML이다.
-from ui.pages.page_settings import (
-    WifiScanWorker, EthernetStatusWorker, WifiStatusWorker, AXIS_NAMES)
 try:
     from utils.io_manager import IOManager
 except ImportError:
@@ -39,6 +34,57 @@ except ImportError:
     LanguageManager = None
 
 _QML_PATH = os.path.join(os.path.dirname(__file__), "PageSettings.qml")
+AXIS_NAMES = ["X축", "Y축", "Z축", "Y2축", "Z2축", "세타", "R1", "R2"]
+
+
+class WifiScanWorker(QThread):
+    sig_done = Signal(list)
+
+    def __init__(self, wifi_module, parent=None):
+        super().__init__(parent)
+        self._wifi = wifi_module
+
+    def run(self):
+        try:
+            networks = self._wifi.scan()
+        except Exception as exc:
+            print(f"[WiFi] 스캔 에러: {exc}")
+            networks = []
+        self.sig_done.emit(networks)
+
+
+class EthernetStatusWorker(QThread):
+    sig_done = Signal(dict)
+
+    def __init__(self, wifi_module, parent=None):
+        super().__init__(parent)
+        self._wifi = wifi_module
+
+    def run(self):
+        try:
+            info = self._wifi.get_ethernet_status()
+        except Exception as exc:
+            print(f"[Ethernet] 상태 조회 에러: {exc}")
+            info = {"iface": "", "state": "", "connection": "", "ip": "",
+                    "gateway": "", "method": ""}
+        self.sig_done.emit(info)
+
+
+class WifiStatusWorker(QThread):
+    sig_done = Signal(dict)
+
+    def __init__(self, wifi_module, parent=None):
+        super().__init__(parent)
+        self._wifi = wifi_module
+
+    def run(self):
+        try:
+            info = self._wifi.get_status()
+        except Exception as exc:
+            print(f"[WiFi] 상태 조회 에러: {exc}")
+            info = {"ssid": "", "signal": "", "ip": "", "iface": "",
+                    "connected": False}
+        self.sig_done.emit(info)
 
 _DEF_Y0X = ["형개허가", "형폐허가", "에젝터 허가", "싸이클스타트",
             "컨베어출력1", "컨베어출력2", "예비1", "예비2",
@@ -48,6 +94,7 @@ _DEF_Y2X = ["척 1 (Chuck 1)", "척 2 (Chuck 2)", "척 3 (Chuck 3)", "척 4 (Chu
             "흡착 1 (Vac 1)", "흡착 2 (Vac 2)", "흡착 3 (Vac 3)", "흡착 4 (Vac 4)",
             "포스쳐 반전", "포스쳐 복귀", "스위블 회전", "스위블 복귀",
             "니퍼 컷팅 1", "니퍼 컷팅 2", "컨베이어 출력", "공급기 출력"]
+_VALVE_CAPACITY = 64
 
 
 # ───────────────────────── 모델 ─────────────────────────
@@ -123,6 +170,10 @@ class SettingsBackend(QObject):
     eConn = Property(str, lambda s: s._p._e["conn"], notify=changed)
     netPriority = Property(str, lambda s: s._p._net_prio, notify=changed)
     ilOpen = Property(bool, lambda s: s._p._il_open, notify=changed)
+    inputGroupLabels = Property(list, lambda s: s._p._group_labels(True), notify=changed)
+    outputGroupLabels = Property(list, lambda s: s._p._group_labels(False), notify=changed)
+    canAddInputGroup = Property(bool, lambda s: s._p._group_count(True) < 4, notify=changed)
+    canAddOutputGroup = Property(bool, lambda s: s._p._group_count(False) < 4, notify=changed)
 
     # ---- 슬롯: 전부 page 의 verbatim 로직 호출 ----
     @Slot(int)
@@ -170,9 +221,25 @@ class SettingsBackend(QObject):
     def editOutName(self, i):
         self._p._edit_io_name(i, False)
 
+    @Slot(int)
+    def toggleOutputStopMode(self, i):
+        self._p._toggle_output_stop_mode(i)
+
     @Slot()
     def applyIoNames(self):
         self._p._apply_io_names()
+
+    @Slot(bool)
+    def addIoGroup(self, is_input):
+        self._p._add_io_group(bool(is_input))
+
+    @Slot(bool, int)
+    def editIoGroup(self, is_input, slot):
+        self._p._edit_io_group(bool(is_input), int(slot))
+
+    @Slot(bool, int)
+    def removeIoGroup(self, is_input, slot):
+        self._p._remove_io_group(bool(is_input), int(slot))
 
     @Slot(int)
     def toggleAxisUse(self, i):
@@ -182,6 +249,14 @@ class SettingsBackend(QObject):
     @Slot(int)
     def toggleAxisDir(self, i):
         self._p._p_dir[i] = 1 - self._p._p_dir[i]
+        self._p._refresh_param_model()
+
+    @Slot(int)
+    def toggleAxisEncoder(self, i):
+        self._p._p_encoder[i] = (
+            "absolute" if self._p._p_encoder[i] == "incremental"
+            else "incremental"
+        )
         self._p._refresh_param_model()
 
     @Slot(int)
@@ -304,12 +379,14 @@ class SettingsBackend(QObject):
 
 
 # ───────────────────────── 페이지 ─────────────────────────
-class PageSettingsQml(QWidget):
+class PageSettingsQml(QObject):
     sig_valve_config_changed = Signal()
+    sig_axis_config_changed = Signal()
 
-    def __init__(self):
+    def __init__(self, overlay=None):
         super().__init__()
         self.plc_client = None
+        self.qml_overlay = overlay
 
         # ---- 상태 배열 (원본 위젯 내용과 1:1) ----
         self._ip = "192.168.0.10"
@@ -324,23 +401,34 @@ class PageSettingsQml(QWidget):
         except Exception:
             self._brightness = 100
 
-        self._v_enabled = [i >= 16 for i in range(32)]
-        self._v_name = [(_DEF_Y2X[i - 16] if i >= 16 else _DEF_Y0X[i])
-                        for i in range(32)]
-        self._v_mode = [True] * 32          # True=toggle
+        mgr = IOManager.instance() if IOManager else None
+        self._v_enabled = [16 <= i < 32 for i in range(_VALVE_CAPACITY)]
+        self._v_name = [
+            (_DEF_Y0X[i] if i < 16 else
+             _DEF_Y2X[i - 16] if i < 32 else
+             (mgr.get_output_name(i) if mgr else f"출력 {i + 1}"))
+            for i in range(_VALVE_CAPACITY)
+        ]
+        self._v_mode = [True] * _VALVE_CAPACITY          # True=toggle
         self._jog_order = []
         self._JOG_MAX = 10          # JOG 팝업 최대 밸브 수
 
         self._p_use = [False] * 8
         self._p_dir = [0] * 8
+        # Existing installations have no encoder classification.  Default to
+        # incremental so their homing requirement remains unchanged.
+        self._p_encoder = ["incremental"] * 8
         self._p_stroke = ["0.000 mm"] * 8
         self._p_accel = ["100"] * 8
         self._p_ppr = ["15000"] * 8
         self._p_home = False
 
         mgr = IOManager.instance() if IOManager else None
-        self._in_name = [(mgr.get_input_name(i) if mgr else "") for i in range(32)]
-        self._out_name = [(mgr.get_output_name(i) if mgr else "") for i in range(32)]
+        self._in_name = [(mgr.get_input_name(i) if mgr else "") for i in range(64)]
+        self._out_name = [(mgr.get_output_name(i) if mgr else "") for i in range(64)]
+        self._out_stop_mode = [
+            (mgr.get_output_stop_mode(i) if mgr else "RESET") for i in range(64)
+        ]
 
         self._w = {"ssid": "-", "signal": "-", "ip": "-", "iface": "-",
                    "toggle": "연결"}
@@ -364,9 +452,13 @@ class PageSettingsQml(QWidget):
         self._il_max_group = 8
 
         # ---- 모델 ----
-        self._io_model = _ListModel(["xaddr", "inname", "yaddr", "outname"], self)
+        self._io_model = _ListModel(
+            ["xaddr", "inname", "inindex", "inhas",
+             "yaddr", "outname", "outindex", "outhas", "outmode"], self,
+        )
         self._param_model = _ListModel(
-            ["axname", "axuse", "axdir", "axstroke", "axaccel", "axppr"], self)
+            ["axname", "axuse", "axencoder", "axdir", "axstroke",
+             "axaccel", "axppr"], self)
         self._valve_model = _ListModel(
             ["vyaddr", "venabled", "vname", "vtoggle", "vjog"], self)
         self._alarm_model = _ListModel(["ano", "amsg", "anoraw"], self)
@@ -379,25 +471,6 @@ class PageSettingsQml(QWidget):
              "mntext", "mnbg", "mnborder", "mnbw", "mnfg"], self)
         self._be = SettingsBackend(self)
         self._be.sig_valve_config_changed.connect(self.sig_valve_config_changed)
-
-        # ---- QML ----
-        self._view = QQuickWidget(self)
-        self._view.setResizeMode(QQuickWidget.SizeRootObjectToView)
-        self._view.setClearColor(QColor("#16202B"))
-        ctx = self._view.rootContext()
-        ctx.setContextProperty("ioModel", self._io_model)
-        ctx.setContextProperty("paramModel", self._param_model)
-        ctx.setContextProperty("valveModel", self._valve_model)
-        ctx.setContextProperty("alarmModel", self._alarm_model)
-        ctx.setContextProperty("wifiModel", self._wifi_model)
-        ctx.setContextProperty("ilModeModel", self._il_mode_model)
-        ctx.setContextProperty("ilGroupModel", self._il_grp_model)
-        ctx.setContextProperty("settingsBackend", self._be)
-        self._view.setSource(QUrl.fromLocalFile(_QML_PATH))
-
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.addWidget(self._view)
 
         # WiFi 주기 타이머 (page_settings 와 동일)
         self._wifi_scan_timer = QTimer(self)
@@ -417,7 +490,7 @@ class PageSettingsQml(QWidget):
         self.update_language()
 
     def _overlay(self):
-        return getattr(self.window(), "qml_overlay", None)
+        return self.qml_overlay
 
     def _message(self, title, message, *, error=False):
         overlay = self._overlay()
@@ -425,14 +498,37 @@ class PageSettingsQml(QWidget):
             overlay.show_message(title, message, error=error)
 
     # ---- 모델 갱신 ----
+    def _group_count(self, is_input):
+        return IOManager.instance().group_count(is_input) if IOManager else 2
+
+    def _group_labels(self, is_input):
+        if not IOManager:
+            return []
+        mgr = IOManager.instance()
+        return [mgr.group_label(is_input, slot)
+                for slot in range(mgr.group_count(is_input))]
+
     def _io_row(self, i):
-        xa = i if i < 16 else i + 16
-        ya = i if i < 16 else i + 16
-        return {"xaddr": f"X{xa:02X}", "inname": self._in_name[i],
-                "yaddr": f"Y{ya:02X}", "outname": self._out_name[i]}
+        mgr = IOManager.instance() if IOManager else None
+        in_count = mgr.point_count(True) if mgr else 32
+        out_count = mgr.point_count(False) if mgr else 32
+        has_in = i < in_count
+        has_out = i < out_count
+        return {
+            "xaddr": mgr.address(True, i) if mgr and has_in else "",
+            "inname": self._in_name[i] if has_in else "",
+            "inindex": i if has_in else -1,
+            "inhas": has_in,
+            "yaddr": mgr.address(False, i) if mgr and has_out else "",
+            "outname": self._out_name[i] if has_out else "",
+            "outindex": i if has_out else -1,
+            "outhas": has_out,
+            "outmode": self._out_stop_mode[i] if has_out else "RESET",
+        }
 
     def _refresh_io_model(self):
-        self._io_model.reset([self._io_row(i) for i in range(32)])
+        count = max(self._group_count(True), self._group_count(False)) * 16
+        self._io_model.reset([self._io_row(i) for i in range(count)])
 
     def _refresh_io_row(self, i):
         self._io_model.update_row(i, self._io_row(i))
@@ -441,27 +537,31 @@ class PageSettingsQml(QWidget):
         rows = []
         for i in range(8):
             rows.append({"axname": AXIS_NAMES[i], "axuse": self._p_use[i],
+                         "axencoder": self._p_encoder[i],
                          "axdir": self._p_dir[i], "axstroke": self._p_stroke[i],
                          "axaccel": self._p_accel[i], "axppr": self._p_ppr[i]})
         self._param_model.reset(rows)
         self._be.changed.emit()
 
     def _valve_row(self, i):
-        ya = i if i < 16 else i + 16
-        return {"vyaddr": f"Y{ya:02X}", "venabled": self._v_enabled[i],
+        mgr = IOManager.instance() if IOManager else None
+        address = mgr.address(False, i) if mgr else f"Y{i:02X}"
+        return {"vyaddr": address, "venabled": self._v_enabled[i],
                 "vname": self._v_name[i], "vtoggle": self._v_mode[i],
                 "vjog": i in self._jog_order}
 
     def _refresh_valve_model(self):
         # 전체 reset — 로드/초기화 전용 (ListView 스크롤 맨위로 튐)
-        self._valve_model.reset([self._valve_row(i) for i in range(32)])
+        count = (IOManager.instance().point_count(False)
+                 if IOManager else min(32, _VALVE_CAPACITY))
+        self._valve_model.reset([self._valve_row(i) for i in range(count)])
 
     def _refresh_valve_row(self, i):
         # 단일 행 dataChanged — 스크롤 위치 보존 (버튼 조작용)
         self._valve_model.update_row(i, self._valve_row(i))
 
     def _refresh_alarm_model(self):
-        from ui.overlays.alarm_overlay import USER_ALARMS
+        from ui.alarm_catalog import USER_ALARMS
         rows = [{"ano": f"A-{no:03d}", "amsg": USER_ALARMS[no], "anoraw": no}
                 for no in sorted(USER_ALARMS.keys())]
         self._alarm_model.reset(rows)
@@ -494,7 +594,9 @@ class PageSettingsQml(QWidget):
         self._swap_valve_data(idx, idx - 1)
 
     def _move_valve_down(self, idx):
-        if idx >= 31:
+        count = (IOManager.instance().point_count(False)
+                 if IOManager else min(32, _VALVE_CAPACITY))
+        if idx >= count - 1:
             return
         self._swap_valve_data(idx, idx + 1)
 
@@ -527,7 +629,7 @@ class PageSettingsQml(QWidget):
 
     def _build_valve_config(self):
         valve_config = []
-        for i in range(32):
+        for i in range(_VALVE_CAPACITY):
             mode = "toggle" if self._v_mode[i] else "momentary"
             jog_pos = self._jog_order.index(i) if i in self._jog_order else -1
             valve_config.append({
@@ -572,13 +674,14 @@ class PageSettingsQml(QWidget):
                 with open(path, 'r', encoding='utf-8') as f:
                     settings = json.load(f)
                     valve_config = settings.get("valve_config", None)
-                    if valve_config and len(valve_config) == 32:
+                    if isinstance(valve_config, list) and valve_config:
                         jog_entries = [(cfg.get("jog_order", -1), i)
                                        for i, cfg in enumerate(valve_config)
-                                       if cfg.get("jog_valve", False)]
+                                       if i < _VALVE_CAPACITY
+                                       and cfg.get("jog_valve", False)]
                         jog_entries.sort(key=lambda x: x[0])
                         self._jog_order = [idx for _, idx in jog_entries]
-                        for i, cfg in enumerate(valve_config):
+                        for i, cfg in enumerate(valve_config[:_VALVE_CAPACITY]):
                             self._v_enabled[i] = cfg.get("enabled", True)
                             self._v_name[i] = cfg.get("name", f"밸브 {i+1}")
                             self._v_mode[i] = (cfg.get("mode", "toggle") == "toggle")
@@ -591,7 +694,7 @@ class PageSettingsQml(QWidget):
         if not IOManager:
             return
         mgr = IOManager.instance()
-        for i in range(32):
+        for i in range(_VALVE_CAPACITY):
             name = self._v_name[i] if i < len(self._v_name) else f"Y{i:02X}"
             mgr.outputs[i] = name
             self._out_name[i] = name
@@ -644,6 +747,7 @@ class PageSettingsQml(QWidget):
 
     def _load_params(self):
         axis_uses_from_file = self._load_axis_settings()
+        self._p_encoder = self._load_encoder_settings()
         if not self.plc_client or not self.plc_client.is_connected:
             if axis_uses_from_file:
                 for i in range(8):
@@ -734,7 +838,9 @@ class PageSettingsQml(QWidget):
                 if error is not None or not result:
                     self._message("오류", f"데이터 전송 중 오류가 발생했습니다.\n{error or 'write failed'}", error=True)
                     return
-                self._save_axis_settings(axis_uses_list, axis_strokes_list)
+                self._save_axis_settings(
+                    axis_uses_list, axis_strokes_list, self._p_encoder)
+                self.sig_axis_config_changed.emit()
                 self._message("적용 완료", "시스템 파라미터가 PLC와 파일에 저장되었습니다.")
             self.plc_client.submit(
                 self.plc_client.write_words, 0x09, self.plc_client.AXIS_PARAM_ADDR,
@@ -743,15 +849,20 @@ class PageSettingsQml(QWidget):
         except Exception as e:
             self._message("오류", f"데이터 전송 중 오류가 발생했습니다.\n{e}", error=True)
 
-    def _save_axis_settings(self, axis_uses_list, axis_strokes_list=None):
+    def _save_axis_settings(self, axis_uses_list, axis_strokes_list=None,
+                            axis_encoder_types=None):
         try:
             path = _get_settings_path()
             settings = load_json(path) or {}
             settings["axis_uses"] = axis_uses_list
             if axis_strokes_list is not None:
                 settings["axis_strokes"] = axis_strokes_list
+            if axis_encoder_types is not None:
+                settings["axis_encoder_types"] = list(axis_encoder_types)
             save_json(path, settings)
-            print(f"[Settings] 축 설정 저장 완료: uses={axis_uses_list}, strokes={axis_strokes_list}")
+            print("[Settings] 축 설정 저장 완료: "
+                  f"uses={axis_uses_list}, encoders={axis_encoder_types}, "
+                  f"strokes={axis_strokes_list}")
         except Exception as e:
             print(f"[Settings] 축 설정 저장 실패: {e}")
 
@@ -769,13 +880,28 @@ class PageSettingsQml(QWidget):
             print(f"[Settings] 축 설정 로드 실패: {e}")
         return [True] * 8
 
+    def _load_encoder_settings(self):
+        try:
+            settings = load_json(_get_settings_path()) or {}
+            values = settings.get("axis_encoder_types", [])
+            if isinstance(values, list) and len(values) == 8:
+                return [
+                    "absolute" if str(value).lower() == "absolute"
+                    else "incremental"
+                    for value in values
+                ]
+        except Exception as e:
+            print(f"[Settings] 엔코더 설정 로드 실패: {e}")
+        return ["incremental"] * 8
+
     # ===================================================================
     # IO 이름 — page_settings 와 동일
     # ===================================================================
     def _edit_io_name(self, i, is_input):
         arr = self._in_name if is_input else self._out_name
-        addr = (f"X{i if i<16 else i+16:02X}" if is_input
-                else f"Y{i if i<16 else i+16:02X}")
+        if not (0 <= i < self._group_count(is_input) * 16):
+            return
+        addr = IOManager.instance().address(is_input, i) if IOManager else "I/O"
         overlay = self._overlay()
         if overlay:
             def done(accepted, value):
@@ -784,12 +910,110 @@ class PageSettingsQml(QWidget):
                     self._refresh_io_row(i)
             overlay.request_text(addr, arr[i], callback=done)
 
+    def _toggle_output_stop_mode(self, i):
+        if not (0 <= i < self._group_count(False) * 16):
+            return
+        self._out_stop_mode[i] = (
+            "LATCH" if self._out_stop_mode[i] == "RESET" else "RESET"
+        )
+        self._refresh_io_row(i)
+
+    def _next_io_group_start(self, is_input):
+        used = set(IOManager.instance().groups(is_input)) if IOManager else set()
+        if used:
+            candidate = max(used) + 0x10
+            if candidate <= 0xF0 and candidate not in used:
+                return candidate
+        return next((value for value in range(0, 0x100, 0x10)
+                     if value not in used), None)
+
+    def _apply_group_configuration(self, is_input, groups, names):
+        if not IOManager:
+            return
+        IOManager.instance().set_group_configuration(
+            is_input, groups, names,
+            None if is_input else self._out_stop_mode,
+        )
+        self._be.changed.emit()
+
+    def _add_io_group(self, is_input):
+        if not IOManager:
+            return
+        mgr = IOManager.instance()
+        groups = mgr.groups(is_input)
+        if len(groups) >= 4:
+            self._message("I/O 그룹", "그룹은 최대 4개까지 추가할 수 있습니다.")
+            return
+        start = self._next_io_group_start(is_input)
+        if start is None:
+            return
+        groups.append(start)
+        names = list(self._in_name if is_input else self._out_name)
+        self._apply_group_configuration(is_input, groups, names)
+
+    def _edit_io_group(self, is_input, slot):
+        if not IOManager:
+            return
+        mgr = IOManager.instance()
+        groups = mgr.groups(is_input)
+        if not 0 <= slot < len(groups):
+            return
+        prefix = "X" if is_input else "Y"
+        choices = [f"{prefix}{start:02X} ~ {prefix}{start + 15:02X}"
+                   for start in range(0, 0x100, 0x10)]
+        current = groups[slot] // 0x10
+        overlay = self._overlay()
+        if not overlay:
+            return
+
+        def done(accepted, index, _value):
+            if not accepted:
+                return
+            start = max(0, min(15, int(index))) * 0x10
+            if start in groups and groups[slot] != start:
+                self._message("주소 중복", "같은 시작 주소는 두 그룹에 지정할 수 없습니다.", error=True)
+                return
+            updated = list(groups)
+            updated[slot] = start
+            names = list(self._in_name if is_input else self._out_name)
+            self._apply_group_configuration(is_input, updated, names)
+
+        overlay.request_selection(
+            f"{prefix} 입력 그룹 시작 주소" if is_input else f"{prefix} 출력 그룹 시작 주소",
+            choices, current, callback=done,
+        )
+
+    def _remove_io_group(self, is_input, slot):
+        if not IOManager:
+            return
+        mgr = IOManager.instance()
+        groups = mgr.groups(is_input)
+        if len(groups) <= 1:
+            self._message("I/O 그룹", "입력과 출력 그룹은 각각 최소 1개가 필요합니다.")
+            return
+        if not 0 <= slot < len(groups):
+            return
+        groups.pop(slot)
+        source = list(self._in_name if is_input else self._out_name)
+        begin = slot * 16
+        names = source[:begin] + source[begin + 16:] + [""] * 16
+        names = names[:64]
+        if not is_input:
+            self._out_stop_mode = (
+                self._out_stop_mode[:begin]
+                + self._out_stop_mode[begin + 16:]
+                + ["RESET"] * 16
+            )[:64]
+        self._apply_group_configuration(is_input, groups, names)
+
     def _apply_io_names(self):
         if not IOManager:
             return
         new_inputs = list(self._in_name)
         new_outputs = list(self._out_name)
-        IOManager.instance().update_names(new_inputs, new_outputs)
+        IOManager.instance().update_names(
+            new_inputs, new_outputs, self._out_stop_mode,
+        )
         for i in range(min(len(new_outputs), len(self._v_name))):
             self._v_name[i] = new_outputs[i]
         self._refresh_valve_model()
@@ -797,31 +1021,28 @@ class PageSettingsQml(QWidget):
         try:
             path = _get_settings_path()
             settings = load_json(path) or {}
-            settings["io_input_names"] = new_inputs
+            settings["io_names"] = IOManager.instance().to_dict()
+            settings["io_input_names"] = new_inputs[:32]
             save_json(path, settings)
             print("[Settings] IO 입력 이름 저장 완료")
         except Exception as e:
             print(f"[Settings] IO 입력 이름 저장 실패: {e}")
-        self._message("적용 완료", "I/O 이름이 적용되었습니다.")
+        self._message("적용 완료", "I/O 이름과 출력 정지동작이 적용되었습니다.")
 
     def _load_io_input_names(self):
-        from utils.io_manager import DEFAULT_INPUTS
         try:
-            saved = []
             path = _get_settings_path()
-            if os.path.exists(path):
-                with open(path, 'r', encoding='utf-8') as f:
-                    settings = json.load(f)
-                saved = settings.get("io_input_names", [])
-            names = list(DEFAULT_INPUTS)
-            for i in range(min(len(saved), 32)):
-                names[i] = saved[i]
             if IOManager:
                 mgr = IOManager.instance()
-                for i in range(32):
-                    mgr.inputs[i] = names[i]
-                    self._in_name[i] = names[i]
-                mgr.sig_names_changed.emit()
+                settings = load_json(path) or {}
+                # One-time migration for installations that predate io_names.
+                if not isinstance(settings.get("io_names"), dict):
+                    saved = settings.get("io_input_names", [])
+                    if isinstance(saved, list) and saved:
+                        migrated = list(mgr.inputs)
+                        migrated[:min(32, len(saved))] = saved[:32]
+                        mgr.update_names(migrated, mgr.outputs)
+                self._on_manager_changed()
             print("[Settings] IO 입력 이름 로드 완료")
         except Exception as e:
             print(f"[Settings] IO 입력 이름 로드 실패: {e}")
@@ -830,20 +1051,26 @@ class PageSettingsQml(QWidget):
         if not IOManager:
             return
         mgr = IOManager.instance()
-        for i in range(32):
+        for i in range(64):
             self._in_name[i] = mgr.get_input_name(i)
             self._out_name[i] = mgr.get_output_name(i)
+            self._out_stop_mode[i] = mgr.get_output_stop_mode(i)
         self._refresh_io_model()
+        self._jog_order = [
+            i for i in self._jog_order if i < mgr.point_count(False)
+        ]
+        self._refresh_valve_model()
+        self._be.changed.emit()
 
     # ===================================================================
     # 알람 — page_settings 와 동일
     # ===================================================================
     def _alarm_next_no(self):
-        from ui.overlays.alarm_overlay import USER_ALARMS
+        from ui.alarm_catalog import USER_ALARMS
         return max(USER_ALARMS.keys(), default=0) + 1
 
     def _add_alarm(self):
-        from ui.overlays.alarm_overlay import USER_ALARMS
+        from ui.alarm_catalog import USER_ALARMS
         no = self._alarm_next_no()
         overlay = self._overlay()
         if overlay:
@@ -854,7 +1081,7 @@ class PageSettingsQml(QWidget):
             overlay.request_text(f"A-{no:03d} 알람 메시지 입력", callback=done)
 
     def _edit_alarm(self, no):
-        from ui.overlays.alarm_overlay import USER_ALARMS
+        from ui.alarm_catalog import USER_ALARMS
         current = USER_ALARMS.get(no, "")
         overlay = self._overlay()
         if overlay:
@@ -865,7 +1092,7 @@ class PageSettingsQml(QWidget):
             overlay.request_text(f"A-{no:03d} 알람 메시지 수정", current, callback=done)
 
     def _delete_alarm(self, no):
-        from ui.overlays.alarm_overlay import USER_ALARMS
+        from ui.alarm_catalog import USER_ALARMS
         overlay = self._overlay()
         if overlay:
             def done(accepted):
@@ -876,7 +1103,7 @@ class PageSettingsQml(QWidget):
                                     callback=done)
 
     def _save_alarms(self):
-        from ui.overlays.alarm_overlay import save_user_alarms
+        from ui.alarm_catalog import save_user_alarms
         save_user_alarms()
         self._message("저장 완료", "알람 메시지가 저장되었습니다.")
 
@@ -1100,7 +1327,7 @@ class PageSettingsQml(QWidget):
             overlay.request_confirm(
                 "프로그램 종료", "정말로 프로그램을 종료하시겠습니까?",
                 accept_text="종료", reject_text="취소",
-                callback=lambda accepted: QApplication.instance().quit() if accepted else None,
+                callback=lambda accepted: QGuiApplication.instance().quit() if accepted else None,
             )
 
     def _set_language(self, code):
@@ -1436,11 +1663,7 @@ class PageSettingsQml(QWidget):
         else:
             self._stop_auto_scan()
 
-    def showEvent(self, event):
-        if not self.plc_client:
-            mw = self.window()
-            if hasattr(mw, 'plc_client'):
-                self.set_plc_client(mw.plc_client)
+    def activate(self):
         if self.plc_client:
             self._on_plc_status_changed(self.plc_client.is_connected)
         if self._cur_tab == 2:
@@ -1450,8 +1673,6 @@ class PageSettingsQml(QWidget):
             self._refresh_eth_status()
             self._refresh_net_priority()
             self._start_auto_scan()
-        super().showEvent(event)
 
-    def hideEvent(self, event):
+    def deactivate(self):
         self._stop_auto_scan()
-        super().hideEvent(event)

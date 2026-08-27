@@ -5,6 +5,7 @@ import "../qml/components" as Components
 
 Rectangle {
     id: root
+    required property var packingBackend
     color: "#111821"
     property var editAxis: ({})
     property string editField: ""
