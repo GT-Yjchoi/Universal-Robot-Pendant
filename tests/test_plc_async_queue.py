@@ -5,6 +5,50 @@ from utils.plc_client import PLCClient
 
 
 class PLCAsyncQueueTests(unittest.TestCase):
+    def test_empty_tcp_response_marks_connection_lost(self):
+        class EmptySocket:
+            closed = False
+
+            def sendall(self, _packet):
+                pass
+
+            def recv(self, _size):
+                return b""
+
+            def close(self):
+                self.closed = True
+
+        client = PLCClient()
+        sock = EmptySocket()
+        client.sock = sock
+        client.is_connected = True
+        states = []
+        client.sig_connected.connect(states.append)
+
+        self.assertIsNone(client.send_packet(b"request"))
+        self.assertFalse(client.is_connected)
+        self.assertIsNone(client.sock)
+        self.assertTrue(sock.closed)
+        self.assertEqual(states, [False])
+
+    def test_missing_monitor_response_invalidates_stale_socket_state(self):
+        class OpenSocket:
+            def close(self):
+                pass
+
+        client = PLCClient()
+        client.sock = OpenSocket()
+        client.is_connected = True
+        client.read_words = lambda *_args: None
+        states = []
+        client.sig_connected.connect(states.append)
+
+        client._poll_monitor_once()
+
+        self.assertFalse(client.is_connected)
+        self.assertIsNone(client.sock)
+        self.assertEqual(states, [False])
+
     def test_final_pendant_memory_map(self):
         client = PLCClient()
         self.assertEqual(client.HEARTBEAT_ADDR, 200)

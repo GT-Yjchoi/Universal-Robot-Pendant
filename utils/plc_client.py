@@ -34,6 +34,7 @@ class PLCClient(QObject):
         self._command_sequence = itertools.count()
         self._next_monitor_at = 0.0
         self._last_monitor_at = 0.0
+        self._last_monitor_success_at = 0.0
         self._command_thread = threading.Thread(
             target=self._command_loop, name="plc-communication-core", daemon=True
         )
@@ -195,6 +196,29 @@ class PLCClient(QObject):
         self.sig_connected.emit(False)
         print("[PLC] 연결 해제")
 
+    def _mark_connection_lost(self, reason=""):
+        """Atomically invalidate the socket and start automatic reconnect.
+
+        A TCP socket can remain locally established after a cable is removed.
+        Every empty response, timeout and heartbeat transport error must pass
+        through this method so the UI never keeps showing a stale connection.
+        """
+        with self.lock:
+            was_connected = self.is_connected
+            self.is_connected = False
+            sock = self.sock
+            self.sock = None
+        if sock:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        if was_connected:
+            detail = f": {reason}" if reason else ""
+            print(f"[PLC] 연결 끊김 감지{detail}")
+            self.sig_connected.emit(False)
+        self._start_reconnect()
+
     def _update_heartbeat(self):
         """
         하트비트 값을 +1 증가시키고 DT200에 전송
@@ -227,19 +251,26 @@ class PLCClient(QObject):
         """
         if not self.sock or not self.is_connected: 
             return None
-        try:
-            with self.lock:
+        failure = None
+        response = None
+        with self.lock:
+            try:
                 length = len(body)
                 prefix = b'\x10\x00' + struct.pack('<H', length) + b'\x02\x00\x02\x00\x00\x00'
                 suffix = bytes([0x01, self.DEST_UNIT_NO])
                 packet = prefix + suffix + body
                 self.sock.sendall(packet)
                 response = self.sock.recv(4096)
-            if len(response) > 12:
-                return response[12:]
-            return response
-        except OSError:
+                if not response:
+                    raise ConnectionError("PLC가 TCP 연결을 종료했습니다")
+            except (OSError, ConnectionError) as exc:
+                failure = str(exc)
+        if failure is not None:
+            self._mark_connection_lost(failure)
             return None
+        if len(response) > 12:
+            return response[12:]
+        return response
 
     def send_packet(self, body):
         """패킷 전송 (헤더 포함).
@@ -247,7 +278,7 @@ class PLCClient(QObject):
         if not self.sock or not self.is_connected:
             return None
         result = None
-        error_happened = False
+        failure = None
         with self.lock:
             try:
                 length = len(body)
@@ -259,6 +290,8 @@ class PLCClient(QObject):
                 t_start = time.time()
                 self.sock.sendall(packet)
                 response = self.sock.recv(4096)
+                if not response:
+                    raise ConnectionError("PLC가 TCP 연결을 종료했습니다")
                 elapsed = (time.time() - t_start) * 1000  # ms
 
                 if elapsed > 30:
@@ -269,13 +302,10 @@ class PLCClient(QObject):
                     result = response[12:]
                 else:
                     result = response
-            except Exception as e:
-                print(f"[PLC] 통신 에러: {e}")
-                self.is_connected = False
-                self.sig_connected.emit(False)
-                error_happened = True
-        if error_happened:
-            self._start_reconnect()
+            except Exception as exc:
+                failure = str(exc)
+        if failure is not None:
+            self._mark_connection_lost(failure)
         return result
 
     def read_words(self, area_code, start_addr, count):
@@ -508,17 +538,26 @@ class PLCClient(QObject):
                         except OSError:
                             pass
                     self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    self.sock.settimeout(3.0)  # 전송/수신 기본 3초 — 실제 PLC 전송은 수십 ms 수준
-                    # TCP keepalive — 랜선 단절을 OS 레벨에서 4~5초 내 감지
+                    # Direct PLC responses are normally around 10 ms.  A
+                    # 750 ms receive limit keeps ample margin while ensuring
+                    # that cable removal reaches the UI in under a second.
+                    self.sock.settimeout(0.75)
+                    # TCP keepalive and user timeout are secondary guards for
+                    # a cable loss while no application packet is in flight.
                     self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
                     try:
                         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 2)
                         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 1)
                         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+                        if hasattr(socket, "TCP_USER_TIMEOUT"):
+                            self.sock.setsockopt(
+                                socket.IPPROTO_TCP, socket.TCP_USER_TIMEOUT, 1500,
+                            )
                     except (AttributeError, OSError):
                         pass  # 플랫폼이 TCP_KEEPIDLE 등을 지원 안 하면 기본값 사용
                     print(f"[PLC] 연결 시도: {self._last_ip}:{self._last_port}")
                     self.sock.connect((self._last_ip, int(self._last_port)))
+                    self._last_monitor_success_at = 0.0
                     self.is_connected = True
                     self.sig_connected.emit(True)
                     print("[PLC] 연결 성공!")
@@ -545,9 +584,16 @@ class PLCClient(QObject):
             try:
                 result = self._parse_monitor_data(raw)
                 self._last_monitor_data = result
+                self._last_monitor_success_at = time.monotonic()
                 self.sig_monitor_data.emit(result)
             except Exception as exc:
                 print(f"[PLC] 모니터링 파싱 에러: {exc}")
+        elif self.is_connected:
+            # TCP is reliable: a cyclic request without a complete response
+            # means this session is no longer usable, even if the OS still
+            # reports the socket as ESTABLISHED.
+            self._mark_connection_lost("PLC 모니터 응답 없음")
+            return
         now = time.monotonic()
         if now - self._last_heartbeat_at >= 0.5:
             self._last_heartbeat_at = now
